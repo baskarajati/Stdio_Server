@@ -419,9 +419,11 @@ describe('project finance roll-up', () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as any;
     const summary = body.data.finance.summary;
-    // 1,035,000,000.00: baseline (base 1,000M + seed VO 25M) plus the two
-    // approved test VOs (5M each) written earlier in this suite.
-    expect(summary.contractValue).toBe(1035000000);
+    // 1,185,000,000.00: the cross-engagement roll-up = design engagement
+    // contract 150M (Rumah Pak Andi seed, commit 715c055) + build baseline
+    // (base 1,000M + seed VO 25M) + the two approved test VOs (5M each)
+    // written earlier in this suite.
+    expect(summary.contractValue).toBe(1185000000);
     expect(summary.variationCount).toBeGreaterThan(0);
   });
 

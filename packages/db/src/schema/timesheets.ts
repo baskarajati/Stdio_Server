@@ -27,6 +27,12 @@ export const timesheetEntries = pgTable('timesheet_entries', {
   entryDate: timestamp('entry_date', { withTimezone: true }).notNull(),
   /** Hours as a decimal string, e.g. `2.50`. Never a float. */
   hours: numeric('hours', { precision: 10, scale: 2 }).notNull(),
+  /**
+   * The labour rate snapshot (SOL-19 section 2.6): set at create time by
+   * the server from the person's `users.hourly_rate`. Never on the wire
+   * (D-007); the budget-versus-actual report reads it for the labour cost.
+   */
+  effectiveHourlyRate: numeric('effective_hourly_rate', { precision: 20, scale: 4 }),
   notes: text('notes'),
   status: text('status').notNull().default('LOGGED'),
   entityVersion: uuid('entity_version').notNull().defaultRandom(),

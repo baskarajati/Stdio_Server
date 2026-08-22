@@ -23,7 +23,11 @@ export type CapabilityKey =
   | 'canWriteInvoiceDraft'
   | 'canIssueInvoice'
   | 'canRecordInvoicePayment'
-  | 'canUpdateInvoiceCollection';
+  | 'canUpdateInvoiceCollection'
+  | 'canWriteClient'
+  | 'canWriteVendor'
+  | 'canWriteSpecItem'
+  | 'canWriteInvoice';
 
 export type CapabilitySet = Record<CapabilityKey, Capability>;
 
@@ -89,5 +93,45 @@ export function projectCapabilities(role: StudioRole): CapabilitySet {
 
     // Collection control is control metadata, not a money write (SOL-6).
     canUpdateInvoiceCollection: { enabled: true, reason: '' },
+
+    // SOL-19 revision 6 register writes. Writes are ownership decisions
+    // (D-007 Q-C: writes are membership-governed); for launch the studio
+    // owner is the writer, matching canWriteQuotation. Other roles read.
+    canWriteClient: {
+      enabled: role === 'OWNER',
+      reason: role === 'OWNER' ? '' : 'Only the studio owner can create and update clients.',
+    },
+    canWriteVendor: {
+      enabled: role === 'OWNER',
+      reason: role === 'OWNER' ? '' : 'Only the studio owner can create and update vendors.',
+    },
+    canWriteSpecItem: {
+      enabled: role === 'OWNER',
+      reason: role === 'OWNER' ? '' : 'Only the studio owner can create and update spec items.',
+    },
+    canWriteInvoice: {
+      enabled: role === 'OWNER',
+      reason: role === 'OWNER' ? '' : 'Only the studio owner can create and update invoices.',
+    },
+  };
+}
+
+/** The SOL-19 timesheet capabilities (contract `TimesheetCapabilities`). */
+export function timesheetCapabilitiesFor(role: StudioRole) {
+  const writer = role === 'OWNER' || role === 'PM';
+  return {
+    create: {
+      enabled: writer,
+      reason: writer ? '' : 'Only the owner and project managers can log timesheet entries.',
+    },
+    edit: {
+      enabled: writer,
+      reason: writer ? '' : 'Only the owner and project managers can edit timesheet entries.',
+    },
+    read: { enabled: true, reason: '' },
+    void: {
+      enabled: writer,
+      reason: writer ? '' : 'Only the owner and project managers can void timesheet entries.',
+    },
   };
 }

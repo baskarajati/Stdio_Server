@@ -20,12 +20,15 @@ import { projectCapabilities } from './capabilities';
 import { type RequestUser, withStudioTx } from './context/db';
 import { resolveToken, type TokenResolution } from './context/token';
 import { meta, problem } from './http';
+import { registerBudgetRoutes } from './routes/budget';
 import { registerContractRoutes } from './routes/contracts';
 import { registerDeprecatedRoutes } from './routes/deprecated';
 import { registerFinanceRoutes } from './routes/finance';
 import { registerInvoiceRoutes } from './routes/invoices';
 import { registerProjectRoutes } from './routes/projects';
 import { registerQuotationRoutes } from './routes/quotations';
+import { registerRegisterRoutes } from './routes/registers';
+import { registerTimesheetRoutes } from './routes/timesheets';
 import { registerVariationOrderRoutes } from './routes/variation-orders';
 import { registerTaxRoutes } from './tax/routes';
 
@@ -126,6 +129,7 @@ export function createApp(pool: Pool) {
   // replaced project-scoped money routes. All run on the tenant path inside
   // `withStudioTx`; the guarded writes additionally carry the idempotency and
   // entity-version guards (see `guards.ts`).
+  registerBudgetRoutes(app, pool);
   registerContractRoutes(app, pool);
   registerProjectRoutes(app, pool);
   registerQuotationRoutes(app, pool);
@@ -139,6 +143,8 @@ export function createApp(pool: Pool) {
   // the SOL-28 deprecation shims: the contract declares the project-scoped
   // send/issue operations with the tax surface (no 410 on those paths), so
   // the tax handlers win those two paths; every other shim stays live.
+  registerRegisterRoutes(app, pool);
+  registerTimesheetRoutes(app, pool);
   registerTaxRoutes(app, pool);
   registerDeprecatedRoutes(app, pool);
 
