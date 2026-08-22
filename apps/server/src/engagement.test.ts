@@ -363,6 +363,64 @@ describe('engagement-scoped variation orders', () => {
     expect(res.status).toBe(409);
     expect(((await res.json()) as any).code).toBe('ENTITY_VERSION_CONFLICT');
   });
+
+  it('SOL-131: a non-UUID contractRevisionId returns 422, not a bare 500', async () => {
+    const engagementVersion = await readEngagementVersion();
+    const key = `vo_uuid_${randomUUID()}`;
+    const body = {
+      boqEffect: '10000000.00',
+      contractRevisionId: 'rev-w3-1',
+      effectiveDate: '2026-08-22T00:00:00Z',
+      feeEffect: '5000000.00',
+      scheduleOfValuesId: randomUUID(),
+    };
+    const res = await app.request(
+      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/project-changes/${SEED_CHANGE}/variation-order`,
+      {
+        method: 'POST',
+        headers: {
+          ...auth(),
+          'Idempotency-Key': key,
+          'If-Match': `"${randomUUID()}", "${engagementVersion}"`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      },
+    );
+    expect(res.status).toBe(422);
+    const payload = (await res.json()) as any;
+    expect(payload.code).toBe('INVALID_UUID_FIELD');
+    expect(payload.detail).toContain('contractRevisionId');
+  });
+
+  it('SOL-131: a non-UUID scheduleOfValuesId returns 422, not a bare 500', async () => {
+    const engagementVersion = await readEngagementVersion();
+    const key = `vo_uuid_sov_${randomUUID()}`;
+    const body = {
+      boqEffect: '10000000.00',
+      contractRevisionId: SEED_CHANGE,
+      effectiveDate: '2026-08-22T00:00:00Z',
+      feeEffect: '5000000.00',
+      scheduleOfValuesId: 'sov-sheet-7',
+    };
+    const res = await app.request(
+      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/project-changes/${SEED_CHANGE}/variation-order`,
+      {
+        method: 'POST',
+        headers: {
+          ...auth(),
+          'Idempotency-Key': key,
+          'If-Match': `"${randomUUID()}", "${engagementVersion}"`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      },
+    );
+    expect(res.status).toBe(422);
+    const payload = (await res.json()) as any;
+    expect(payload.code).toBe('INVALID_UUID_FIELD');
+    expect(payload.detail).toContain('scheduleOfValuesId');
+  });
 });
 
 describe('engagement-scoped invoices', () => {

@@ -66,6 +66,31 @@ function decimalFromMinor(minor: bigint, currency: string): string {
   return moneyToDecimal(money(minor, currency));
 }
 
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Returns the first field in `fields` whose value is present but not a valid
+ * UUID, or null when every field is a valid UUID, null, or absent. Used for
+ * fields that map to Postgres `uuid` columns, so a bad value never surfaces
+ * as a bare 22P02 500 (SOL-131).
+ */
+function firstInvalidUuid(
+  body: Record<string, unknown>,
+  fields: string[],
+): string | null {
+  for (const field of fields) {
+    const value = body[field];
+    if (value === null || value === undefined) {
+      continue;
+    }
+    if (typeof value !== 'string' || !UUID_PATTERN.test(value)) {
+      return field;
+    }
+  }
+  return null;
+}
+
 /** Projects one variation-order row into the contract `VariationOrder` shape. */
 function projectVariationOrder(
   row: Record<string, unknown>,
@@ -434,6 +459,25 @@ export function registerVariationOrderRoutes(app: Hono<ServerEnv>, pool: Pool): 
         c.req.header('Content-Type') ?? null,
         rawBody,
       );
+
+      // SOL-131: contractRevisionId and scheduleOfValuesId are uuid columns.
+      // A non-UUID value used to pass request validation and then die inside
+      // the transaction with Postgres 22P02, surfacing as a bare HTTP 500.
+      // Validate them up front so the caller gets a typed 422 instead.
+      const requestRecord = (body ?? {}) as Record<string, unknown>;
+      const uuidFieldError = firstInvalidUuid(requestRecord, [
+        'contractRevisionId',
+        'scheduleOfValuesId',
+      ]);
+      if (uuidFieldError) {
+        return problem(c, {
+          status: 422,
+          code: 'INVALID_UUID_FIELD',
+          title: 'Invalid UUID field',
+          detail: `${uuidFieldError} must be a valid UUID (or null).`,
+          requestId: c.get('requestId'),
+        });
+      }
 
       const result = await guardedWrite(
         pool,

@@ -9,11 +9,13 @@
  * in this script bypasses the boundary.
  *
  * Running the seed twice updates the same rows; it never duplicates them.
+ *
+ * The function is also exported so integration suites can seed their own
+ * scratch database (SOL-134: the tax-slice suite must never write TEST- rows
+ * into the shared `stdio_dev` database).
  */
+import { pathToFileURL } from 'node:url';
 import pg from 'pg';
-
-const connectionString =
-  process.env.DATABASE_URL ?? 'postgres://stdio:stdio@localhost:5432/stdio_dev';
 
 /** Stable ids so the seed is idempotent and the fixtures are addressable. */
 const IDS = {
@@ -35,7 +37,8 @@ const IDS = {
   projectChange: '00000000-0000-4000-8000-000000000010',
 };
 
-async function main(): Promise<void> {
+/** Seeds the Studio Contoh fixtures. See the module doc comment. */
+export async function seedDatabase(connectionString: string): Promise<void> {
   const session = new pg.Client({ connectionString });
   await session.connect();
   try {
@@ -220,7 +223,16 @@ async function main(): Promise<void> {
   console.log(`Seeded studio ${IDS.studio} (Studio Contoh) into the database.`);
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+async function main(): Promise<void> {
+  const connectionString =
+    process.env.DATABASE_URL ?? 'postgres://stdio:stdio@localhost:5432/stdio_dev';
+  await seedDatabase(connectionString);
+}
+
+/** Runs the seed only when executed directly (pnpm db:seed), not on import. */
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

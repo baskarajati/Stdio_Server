@@ -11,3 +11,4 @@ export function createDatabase(connectionString: string) {
 }
 
 export { schema };
+export { seedDatabase } from './seed';
