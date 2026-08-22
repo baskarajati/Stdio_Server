@@ -18,7 +18,7 @@
  */
 
 import { schema } from '@stdio/db';
-import { and, count, desc, eq, ilike, inArray, or, sql, type SQL } from 'drizzle-orm';
+import { and, count, desc, eq, ilike, inArray, or, type SQL, sql } from 'drizzle-orm';
 import type { Hono } from 'hono';
 import type { Pool } from 'pg';
 
@@ -209,7 +209,9 @@ function projectSummary(
     },
     projectCode: row.projectCode,
     projectTypeLabel: statusLabel(row.projectType) ?? row.projectType,
-    serviceModelLabel: row.serviceModel ? (statusLabel(row.serviceModel) ?? row.serviceModel) : null,
+    serviceModelLabel: row.serviceModel
+      ? (statusLabel(row.serviceModel) ?? row.serviceModel)
+      : null,
     siteAddress: row.siteAddress,
     source: { href: `/projects/${row.id}`, type: 'project' },
     stageLabel: projectStage(row, engagementRows),
