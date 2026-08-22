@@ -55,30 +55,43 @@ export type VerifiedPpnRule = {
 };
 
 /**
- * The controlled evidence register. PMK 131/2024 was signed and promulgated
- * on 2024-12-31 and became effective 2025-01-01 (verified). The PER-11/PJ/2025
- * date is taken from the published record (2025-05-22) and is a review item
- * for the Founding Engineer PR review.
+ * The controlled evidence register. Every URL is a verified jdih
+ * `full_text_pdf` path: UU 7/2021 and PMK 131/2024 were verified against the
+ * official jdih catalogue under SOL-106 condition C1 (artifact SHA-256 in
+ * `docs/tax/evidence-register-verification.md`), and re-confirmed on
+ * 2026-08-22 for the SOL-116 port. PER-11/PJ/2025 was verified the same way
+ * on 2026-08-22 (SOL-116). Listing pages and short `/dok/...` paths are
+ * rejected by `assertPresetRegisterValid`.
  */
 export const PPN_2025_EVIDENCE: readonly VerifiedTaxEvidence[] = [
+  {
+    evidenceId: 'UU-7-2021-HPP',
+    authority: 'DJP_RI',
+    documentIdentifier: 'UU 7/2021',
+    title: 'Undang-Undang Nomor 7 Tahun 2021 tentang Harmonisasi Peraturan Perpajakan',
+    url: 'https://jdih.kemenkeu.go.id/api/download/A9FAAB97-ACA7-4F87-9FDC-FAA8123D1454/7TAHUN2021UU.pdf',
+    publishedAt: '2021-10-29',
+    retrievedAt: '2026-08-22T21:10:00.000Z',
+  },
   {
     evidenceId: 'PMK-131-2024-ART3',
     authority: 'DJP_RI',
     documentIdentifier: 'PMK-131/PMK.010/2024',
     title:
-      'PMK 131 Tahun 2024 — Perlakuan Pajak Pertambahan Nilai atas Impor Barang Kena Pajak, Penyerahan Barang Kena Pajak, Penyerahan Jasa Kena Pajak, Pemanfaatan Barang Kena Pajak Tidak Berwujud dari Luar Daerah Pabean di dalam Daerah Pabean, dan Pemanfaatan Jasa Kena Pajak dari Luar Daerah Pabean di dalam Daerah Pabean',
-    url: 'https://www.pajak.go.id/index.php/id/peraturan/perlakuan-pajak-pertambahan-nilai-atas-impor-barang-kena-pajak-penyerahan-barang-kena',
+      'Peraturan Menteri Keuangan Nomor 131 Tahun 2024 tentang Perlakuan Pajak Pertambahan Nilai atas Impor Barang Kena Pajak, Penyerahan Barang Kena Pajak, Penyerahan Jasa Kena Pajak, Pemanfaatan Barang Kena Pajak Tidak Berwujud dari Luar Daerah Pabean di Dalam Daerah Pabean, dan Pemanfaatan Jasa Kena Pajak dari Luar Daerah Pabean di Dalam Daerah Pabean',
+    url: 'https://jdih.kemenkeu.go.id/api/download/F128868E-3CF6-4596-8407-C34EECA0E7BE/2024pmkeuangan131.pdf',
     publishedAt: '2024-12-31',
-    retrievedAt: '2026-08-21T00:00:00.000Z',
+    retrievedAt: '2026-08-22T21:10:00.000Z',
   },
   {
     evidenceId: 'PMK-131-2024-JDIH',
     authority: 'KEMENKEU_RI',
     documentIdentifier: 'PMK-131-TAHUN-2024',
-    title: 'PMK 131 Tahun 2024 — Kemenkeu JDIH regulation record',
-    url: 'https://jdih.kemenkeu.go.id/dok/pmk-131-tahun-2024',
+    title:
+      'Peraturan Menteri Keuangan Nomor 131 Tahun 2024 tentang Perlakuan Pajak Pertambahan Nilai atas Impor Barang Kena Pajak, Penyerahan Barang Kena Pajak, Penyerahan Jasa Kena Pajak, Pemanfaatan Barang Kena Pajak Tidak Berwujud dari Luar Daerah Pabean di Dalam Daerah Pabean, dan Pemanfaatan Jasa Kena Pajak dari Luar Daerah Pabean di Dalam Daerah Pabean',
+    url: 'https://jdih.kemenkeu.go.id/api/download/F128868E-3CF6-4596-8407-C34EECA0E7BE/2024pmkeuangan131.pdf',
     publishedAt: '2024-12-31',
-    retrievedAt: '2026-08-21T00:00:00.000Z',
+    retrievedAt: '2026-08-22T21:10:00.000Z',
   },
   {
     evidenceId: 'PER-11-PJ-2025-ART129',
@@ -86,9 +99,9 @@ export const PPN_2025_EVIDENCE: readonly VerifiedTaxEvidence[] = [
     documentIdentifier: 'PER-11/PJ/2025',
     title:
       'PER-11/PJ/2025 — Ketentuan Pelaporan Pajak Penghasilan, Pajak Pertambahan Nilai, Pajak Penjualan atas Barang Mewah, dan Bea Meterai dalam Rangka Pelaksanaan Sistem Inti Administrasi Perpajakan',
-    url: 'https://pajak.go.id/id/peraturan/ketentuan-pelaporan-pajak-penghasilan-pajak-pertambahan-nilai-pajak-penjualan-atas-barang',
+    url: 'https://jdih.kemenkeu.go.id/api/download/A94EDEE5-E585-4EEB-B9E7-A76F616C92FB/PER-11_PJ_2025.pdf',
     publishedAt: '2025-05-22',
-    retrievedAt: '2026-08-21T00:00:00.000Z',
+    retrievedAt: '2026-08-22T22:05:00.000Z',
   },
 ];
 
@@ -171,4 +184,47 @@ export function resolveVerifiedRule(
     );
   }
   return matches[0] ?? null;
+}
+
+/**
+ * Fails closed on a corrupt or unverified register (SOL-104 condition C1,
+ * ported from the old stack). Every evidence URL must be a government
+ * document on `pajak.go.id` or `jdih.kemenkeu.go.id`; evidence ids and
+ * exclusion codes must be unique and non-empty; the register must hold only
+ * `PPN_STANDARD_2025` from 2025-01-01 onward. Arguments default to the
+ * shipped constants so the guard is directly testable on bad input.
+ */
+export function assertPresetRegisterValid(
+  evidence: readonly VerifiedTaxEvidence[] = PPN_2025_EVIDENCE,
+  exclusions: readonly VerifiedTaxExclusion[] = PPN_2025_EXCLUSIONS,
+  register: readonly VerifiedPpnRule[] = PPN_2025_REGISTER,
+): void {
+  const evidenceIds = new Set<string>();
+  for (const entry of evidence) {
+    if (!entry.evidenceId || evidenceIds.has(entry.evidenceId)) {
+      throw new Error('TAX_RULE_REGISTER_INVALID: duplicate or empty evidenceId');
+    }
+    if (entry.authority !== 'KEMENKEU_RI' && entry.authority !== 'DJP_RI') {
+      throw new Error('TAX_RULE_REGISTER_INVALID: unknown authority');
+    }
+    if (!/^https:\/\/(?:www\.)?(?:pajak\.go\.id|jdih\.kemenkeu\.go\.id)\//.test(entry.url)) {
+      throw new Error(`TAX_RULE_REGISTER_INVALID: non-government URL ${entry.url}`);
+    }
+    evidenceIds.add(entry.evidenceId);
+  }
+  const exclusionCodes = new Set<string>();
+  for (const exclusion of exclusions) {
+    if (!exclusion.code || exclusionCodes.has(exclusion.code)) {
+      throw new Error('TAX_RULE_REGISTER_INVALID: duplicate or empty exclusion code');
+    }
+    exclusionCodes.add(exclusion.code);
+  }
+  for (const version of register) {
+    if (version.code !== 'PPN_STANDARD_2025') {
+      throw new Error('TAX_RULE_REGISTER_INVALID: bad code');
+    }
+    if (version.effectiveFrom < '2025-01-01') {
+      throw new Error('TAX_RULE_REGISTER_INVALID: bad start');
+    }
+  }
 }

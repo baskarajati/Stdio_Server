@@ -15,7 +15,13 @@ import {
   parseStrictMoneyInput,
   wholeIdrOutput,
 } from './money-input';
-import { PPN_STANDARD_2025, resolveVerifiedRule } from './ppn-2025';
+import {
+  assertPresetRegisterValid,
+  PPN_2025_EVIDENCE,
+  PPN_STANDARD_2025,
+  resolveVerifiedRule,
+  type VerifiedTaxEvidence,
+} from './ppn-2025';
 
 describe('MoneyInput grammar (section 3, N20)', () => {
   it.each(['', '.5', '1.', '1e', '1e+', '--1', ' 1 ', '1  ', '1,5', 'NaN', 'Infinity'])(
@@ -199,6 +205,49 @@ describe('B9 reference algorithm (section 9.4)', () => {
     ];
     expect(() => resolveVerifiedRule('2025-07-01', corrupt)).toThrowError(
       'TAX_RULE_REGISTER_INVALID',
+    );
+  });
+});
+
+describe('assertPresetRegisterValid (SOL-104 condition C1, SOL-116 port)', () => {
+  const verifiedUrls = {
+    uu7: 'https://jdih.kemenkeu.go.id/api/download/A9FAAB97-ACA7-4F87-9FDC-FAA8123D1454/7TAHUN2021UU.pdf',
+    pmk131: 'https://jdih.kemenkeu.go.id/api/download/F128868E-3CF6-4596-8407-C34EECA0E7BE/2024pmkeuangan131.pdf',
+    per11: 'https://jdih.kemenkeu.go.id/api/download/A94EDEE5-E585-4EEB-B9E7-A76F616C92FB/PER-11_PJ_2025.pdf',
+  };
+
+  it('passes the shipped register (all URLs are verified jdih full_text_pdf paths)', () => {
+    expect(() => assertPresetRegisterValid()).not.toThrow();
+  });
+
+  it('ships the two SOL-106 C1 corrected entries and the verified PER-11 path', () => {
+    const byId = new Map(PPN_2025_EVIDENCE.map((entry) => [entry.evidenceId, entry.url]));
+    expect(byId.get('UU-7-2021-HPP')).toBe(verifiedUrls.uu7);
+    expect(byId.get('PMK-131-2024-JDIH')).toBe(verifiedUrls.pmk131);
+    expect(byId.get('PMK-131-2024-ART3')).toBe(verifiedUrls.pmk131);
+    expect(byId.get('PER-11-PJ-2025-ART129')).toBe(verifiedUrls.per11);
+    // No listing pages or short /dok/... paths may ship.
+    for (const entry of PPN_2025_EVIDENCE) {
+      expect(entry.url).toMatch(/^https:\/\/jdih\.kemenkeu\.go\.id\/api\/download\//);
+    }
+  });
+
+  it('fails closed on a non-government register URL', () => {
+    const bad = PPN_2025_EVIDENCE.map((entry) =>
+      entry.evidenceId === 'UU-7-2021-HPP'
+        ? { ...entry, url: 'https://example.com/uu-7-2021.pdf' }
+        : entry,
+    );
+    expect(() => assertPresetRegisterValid(bad)).toThrowError(
+      'TAX_RULE_REGISTER_INVALID: non-government URL',
+    );
+  });
+
+  it('fails closed on a duplicate evidenceId', () => {
+    const first = PPN_2025_EVIDENCE[0] as VerifiedTaxEvidence;
+    const bad = [first, first];
+    expect(() => assertPresetRegisterValid(bad)).toThrowError(
+      'TAX_RULE_REGISTER_INVALID: duplicate or empty evidenceId',
     );
   });
 });
