@@ -312,15 +312,18 @@ describe('budget-versus-actual report', () => {
   });
 
   it('counts APPROVED labour at the snapshot rate and never projects a rate', async () => {
+    // A dedicated project: the seed project's timesheets are mutated by the
+    // parallel timesheets suite, so totals there are not hermetic.
+    const { projectId } = await fixtureProject();
     await tenantQuery(SEED_STUDIO, async (client) => {
       await client.query(
         `INSERT INTO timesheet_entries
            (id, studio_id, user_id, project_id, entry_date, hours, notes, status, effective_hourly_rate)
          VALUES (gen_random_uuid(), $1, $2, $3, '2026-08-22T00:00:00.000Z', '8.00', 'bgt-test', 'APPROVED', '125000.0000')`,
-        [SEED_STUDIO, SEED_OWNER, SEED_PROJECT],
+        [SEED_STUDIO, SEED_OWNER, projectId],
       );
     });
-    const res = await app.request(`/projects/${SEED_PROJECT}/budget-vs-actual`, {
+    const res = await app.request(`/projects/${projectId}/budget-vs-actual`, {
       headers: auth(),
     });
     const report = ((await res.json()) as any).data.report;
@@ -336,19 +339,20 @@ describe('budget-versus-actual report', () => {
   });
 
   it('does not count LOGGED entries', async () => {
+    const { projectId } = await fixtureProject();
     await tenantQuery(SEED_STUDIO, async (client) => {
       await client.query(
         `INSERT INTO timesheet_entries
            (id, studio_id, user_id, project_id, entry_date, hours, notes, status, effective_hourly_rate)
          VALUES (gen_random_uuid(), $1, $2, $3, '2026-08-21T00:00:00.000Z', '5.00', 'bgt-test', 'LOGGED', '125000.0000')`,
-        [SEED_STUDIO, SEED_OWNER, SEED_PROJECT],
+        [SEED_STUDIO, SEED_OWNER, projectId],
       );
     });
-    const res = await app.request(`/projects/${SEED_PROJECT}/budget-vs-actual`, {
+    const res = await app.request(`/projects/${projectId}/budget-vs-actual`, {
       headers: auth(),
     });
     const report = ((await res.json()) as any).data.report;
-    expect(report.labourActualCost).toBe('1000000.00');
+    expect(report.labourActualCost).toBe('0.00');
   });
 
   it('denies a DESIGNER (403) and 404s a foreign project', async () => {
