@@ -1,0 +1,21 @@
+{
+  "name": "@stdio/desktop",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "echo 'The macOS bundle needs Rust and Xcode. Run pnpm desktop:bundle.'",
+    "bundle": "tauri build",
+    "typecheck": "tsc --noEmit",
+    "test": "echo 'No desktop test yet.'"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4",
+    "@types/node": "24.13.3",
+    "typescript": "5.9.3"
+  }
+}

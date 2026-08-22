@@ -1,0 +1,2 @@
+ALTER TABLE "variation_orders" ADD COLUMN "project_change_id" uuid;--> statement-breakpoint
+ALTER TABLE "variation_orders" ADD CONSTRAINT "variation_orders_project_change_id_project_changes_id_fk" FOREIGN KEY ("project_change_id") REFERENCES "public"."project_changes"("id") ON DELETE no action ON UPDATE no action;

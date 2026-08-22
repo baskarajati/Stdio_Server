@@ -1,0 +1,31 @@
+{
+  "name": "stdio",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Stdio — business management for interior and architecture studios.",
+  "packageManager": "pnpm@9.15.4",
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "scripts": {
+    "dev": "turbo run dev --filter=@stdio/web",
+    "dev:all": "turbo run dev",
+    "build": "turbo run build",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
+    "gate": "pnpm install --frozen-lockfile && pnpm db:migrate && pnpm db:seed && pnpm verify",
+    "desktop:dev": "pnpm --filter @stdio/desktop dev",
+    "desktop:build": "pnpm --filter @stdio/desktop build",
+    "db:generate": "pnpm --filter @stdio/db generate",
+    "db:migrate": "pnpm --filter @stdio/db migrate",
+    "db:seed": "pnpm --filter @stdio/db seed"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.9",
+    "turbo": "2.10.11",
+    "typescript": "5.9.3"
+  }
+}

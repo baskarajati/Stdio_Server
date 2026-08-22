@@ -1,0 +1,30 @@
+{
+  "name": "@stdio/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@hono/node-server": "2.1.1",
+    "@stdio/core": "workspace:*",
+    "@stdio/db": "workspace:*",
+    "drizzle-orm": "0.45.2",
+    "hono": "4.13.3",
+    "pg": "8.23.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "@types/pg": "8.23.1",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11",
+    "yaml": "2.8.1"
+  }
+}
