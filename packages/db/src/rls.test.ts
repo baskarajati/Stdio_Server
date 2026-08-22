@@ -308,12 +308,38 @@ describe('money columns', () => {
     );
 
     expect(moneyColumns.rows.length).toBeGreaterThan(0);
+    // SOL-19 section 2.6 defines the two labour RATE columns as
+    // numeric(20,4) on purpose: rates are unit rates, not money amounts.
+    // They are exempted from the numeric(20,2) money rule and asserted
+    // separately so a future drift still fails.
+    const moneyRows = moneyColumns.rows.filter(
+      (column) =>
+        !(
+          (column.table_name === 'users' && column.column_name === 'labour_rate') ||
+          (column.table_name === 'timesheet_entries' &&
+            column.column_name === 'effective_hourly_rate')
+        ),
+    );
     expect(
-      moneyColumns.rows.every(
+      moneyRows.every(
         (column) =>
           column.data_type === 'numeric' &&
           column.numeric_precision === 20 &&
           column.numeric_scale === 2,
+      ),
+    ).toBe(true);
+    const rateRows = moneyColumns.rows.filter(
+      (column) =>
+        (column.table_name === 'users' && column.column_name === 'labour_rate') ||
+        (column.table_name === 'timesheet_entries' &&
+          column.column_name === 'effective_hourly_rate'),
+    );
+    expect(
+      rateRows.every(
+        (column) =>
+          column.data_type === 'numeric' &&
+          column.numeric_precision === 20 &&
+          column.numeric_scale === 4,
       ),
     ).toBe(true);
   });

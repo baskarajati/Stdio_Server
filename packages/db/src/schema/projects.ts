@@ -1,4 +1,4 @@
-import { numeric, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
+import { numeric, pgTable, text, timestamp, unique, uuid } from 'drizzle-orm/pg-core';
 import { studios, tenantColumns, users } from './base';
 import { clients } from './clients';
 
@@ -33,7 +33,10 @@ export const projects = pgTable('projects', {
   budgetAmount: numeric('budget_amount', { precision: 20, scale: 2 }),
   entityVersion: uuid('entity_version').notNull().defaultRandom(),
   ...tenantColumns,
-});
+}, (table) => [
+  /** Referenced by child tables through tenant-matching foreign keys. */
+  unique('projects_studio_id_unq').on(table.studioId, table.id),
+]);
 
 /**
  * One engagement on a project. Shape from `ProjectEngagement` in the

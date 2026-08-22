@@ -20,11 +20,14 @@ import { projectCapabilities } from './capabilities';
 import { type RequestUser, withStudioTx } from './context/db';
 import { resolveToken, type TokenResolution } from './context/token';
 import { meta, problem } from './http';
+import { registerBudgetRoutes } from './routes/budget';
 import { registerContractRoutes } from './routes/contracts';
 import { registerDeprecatedRoutes } from './routes/deprecated';
 import { registerFinanceRoutes } from './routes/finance';
 import { registerInvoiceRoutes } from './routes/invoices';
 import { registerQuotationRoutes } from './routes/quotations';
+import { registerRegisterRoutes } from './routes/registers';
+import { registerTimesheetRoutes } from './routes/timesheets';
 import { registerVariationOrderRoutes } from './routes/variation-orders';
 import { registerTaxRoutes } from './tax/routes';
 
@@ -130,6 +133,15 @@ export function createApp(pool: Pool) {
   registerVariationOrderRoutes(app, pool);
   registerInvoiceRoutes(app, pool);
   registerFinanceRoutes(app, pool);
+
+  // SOL-19 revision 6: the timesheet register, the budget-versus-actual
+  // report, and the ten register writes (clients, vendors, spec-items,
+  // quotations, invoices). All run on the tenant path inside
+  // `withStudioTx`; every mutation carries the idempotency and entity-
+  // version guards (see `guards.ts`).
+  registerTimesheetRoutes(app, pool);
+  registerBudgetRoutes(app, pool);
+  registerRegisterRoutes(app, pool);
 
   // SOL-25 revision 24: the tax surface (discovery, preview, guarded custom
   // rule and supplier-recording writes, and the three issue operations with

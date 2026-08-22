@@ -154,6 +154,13 @@ beforeAll(async () => {
        WHERE id = $1`,
       [BUILD_ENGAGEMENT],
     );
+    // The design engagement carries no money of its own: reset it so the
+    // project finance roll-up is deterministic against the shared database.
+    await client.query(
+      `UPDATE project_engagements SET contract_value = NULL, transaction_price = NULL
+       WHERE id = $1`,
+      [DESIGN_ENGAGEMENT],
+    );
   });
 });
 

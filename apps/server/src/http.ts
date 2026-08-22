@@ -60,6 +60,18 @@ export function meta(requestId: string, options: MetaOptions = {}) {
   };
 }
 
+/**
+ * The `MutationMeta` envelope (SOL-19 revision 6): `Meta` plus the required
+ * `idempotentReplay` flag. The guard flips `false` to `true` in the stored
+ * response TEXT on a same-key replay, so money tokens stay byte-exact.
+ */
+export function mutationMeta(
+  requestId: string,
+  options: MetaOptions = {},
+): Record<string, unknown> {
+  return { ...meta(requestId, options), idempotentReplay: false };
+}
+
 /** Reads the optional `x-businessapp-native-build` header. */
 export function requestBuildOf(c: Context): number | null {
   const raw = c.req.header('x-businessapp-native-build');

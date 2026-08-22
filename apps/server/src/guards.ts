@@ -125,6 +125,28 @@ export function parseIfMatch(header: string | undefined): string[] | null {
 }
 
 /**
+ * The `409 ENTITY_VERSION_CONFLICT` problem body the contract declares
+ * (details carry `draftPreserved: true` and the current version to refetch).
+ * A guarded-write handler returns this body for a version conflict so the
+ * response is stored verbatim on the idempotency row and a same-key retry
+ * replays the exact problem bytes.
+ */
+export function entityConflictBody(
+  c: Context,
+  currentEntityVersion: string | null,
+): Record<string, unknown> {
+  return {
+    type: 'urn:stdio:error',
+    title: 'Entity version conflict',
+    status: 409,
+    detail: 'The If-Match entity version does not match the current entity. Refetch and retry.',
+    code: 'ENTITY_VERSION_CONFLICT',
+    requestId: c.get('requestId'),
+    details: { draftPreserved: true, currentEntityVersion },
+  };
+}
+
+/**
  * Writes the `409 ENTITY_VERSION_CONFLICT` problem the contract declares
  * (details carry `draftPreserved: true` and the current version to refetch).
  */
