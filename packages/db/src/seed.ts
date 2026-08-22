@@ -51,9 +51,9 @@ async function main(): Promise<void> {
     );
 
     await session.query(
-      `INSERT INTO users (id, studio_id, email, name, role)
-       VALUES ($1, $2, 'owner@contoh.studio', 'Pemilik Studio', 'OWNER')
-       ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name`,
+      `INSERT INTO users (id, studio_id, email, name, role, hourly_rate)
+       VALUES ($1, $2, 'owner@contoh.studio', 'Pemilik Studio', 'OWNER', '125000.0000')
+       ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, hourly_rate = EXCLUDED.hourly_rate`,
       [IDS.owner, IDS.studio],
     );
 
@@ -78,13 +78,15 @@ async function main(): Promise<void> {
     // decision record's Rumah Pak Andi case (design Rp 150jt, build Rp 850jt).
     await session.query(
       `INSERT INTO project_engagements (id, studio_id, project_id, kind, sort_order,
-                                        lifecycle_status, contract_state, current_phase_key,
-                                        phase_count, completed_phase_count)
-       VALUES ($1, $2, $3, 'DESIGN', 1, 'ACTIVE', 'SIGNED', 'design-development', 3, 1)
+                                        lifecycle_status, contract_state, contract_value,
+                                        current_phase_key, phase_count, completed_phase_count)
+       VALUES ($1, $2, $3, 'DESIGN', 1, 'ACTIVE', 'SIGNED', '150000000.00',
+               'design-development', 3, 1)
        ON CONFLICT (id) DO UPDATE SET kind = EXCLUDED.kind,
              sort_order = EXCLUDED.sort_order,
              lifecycle_status = EXCLUDED.lifecycle_status,
              contract_state = EXCLUDED.contract_state,
+             contract_value = EXCLUDED.contract_value,
              current_phase_key = EXCLUDED.current_phase_key,
              phase_count = EXCLUDED.phase_count,
              completed_phase_count = EXCLUDED.completed_phase_count`,
@@ -93,13 +95,14 @@ async function main(): Promise<void> {
 
     await session.query(
       `INSERT INTO project_engagements (id, studio_id, project_id, kind, sort_order,
-                                        lifecycle_status, contract_state, current_phase_key,
-                                        phase_count, completed_phase_count)
-       VALUES ($1, $2, $3, 'BUILD', 2, 'ACTIVE', 'SIGNED', 'construction', 1, 0)
+                                        lifecycle_status, contract_state, contract_value,
+                                        current_phase_key, phase_count, completed_phase_count)
+       VALUES ($1, $2, $3, 'BUILD', 2, 'ACTIVE', 'SIGNED', '850000000.00', 'construction', 1, 0)
        ON CONFLICT (id) DO UPDATE SET kind = EXCLUDED.kind,
              sort_order = EXCLUDED.sort_order,
              lifecycle_status = EXCLUDED.lifecycle_status,
              contract_state = EXCLUDED.contract_state,
+             contract_value = EXCLUDED.contract_value,
              current_phase_key = EXCLUDED.current_phase_key,
              phase_count = EXCLUDED.phase_count,
              completed_phase_count = EXCLUDED.completed_phase_count`,
@@ -199,8 +202,9 @@ async function main(): Promise<void> {
 
     await session.query(
       `INSERT INTO timesheet_entries (id, studio_id, user_id, project_id, entry_date, hours,
-                                      notes, status)
-       VALUES ($1, $2, $3, $4, '2026-08-20', '7.50', 'Survei lokasi', 'LOGGED')
+                                      notes, status, effective_hourly_rate)
+       VALUES ($1, $2, $3, $4, '2026-08-20T00:00:00.000Z', '7.50', 'Survei lokasi', 'LOGGED',
+               '125000.0000')
        ON CONFLICT (id) DO UPDATE SET hours = EXCLUDED.hours`,
       [IDS.timesheetEntry, IDS.studio, IDS.owner, IDS.project],
     );
