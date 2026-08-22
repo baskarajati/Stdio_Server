@@ -81,7 +81,13 @@ async function main(): Promise<void> {
                                         lifecycle_status, contract_state, current_phase_key,
                                         phase_count, completed_phase_count)
        VALUES ($1, $2, $3, 'DESIGN', 1, 'ACTIVE', 'SIGNED', 'design-development', 3, 1)
-       ON CONFLICT (id) DO UPDATE SET kind = EXCLUDED.kind`,
+       ON CONFLICT (id) DO UPDATE SET kind = EXCLUDED.kind,
+             sort_order = EXCLUDED.sort_order,
+             lifecycle_status = EXCLUDED.lifecycle_status,
+             contract_state = EXCLUDED.contract_state,
+             current_phase_key = EXCLUDED.current_phase_key,
+             phase_count = EXCLUDED.phase_count,
+             completed_phase_count = EXCLUDED.completed_phase_count`,
       [IDS.designEngagement, IDS.studio, IDS.project],
     );
 
@@ -90,7 +96,13 @@ async function main(): Promise<void> {
                                         lifecycle_status, contract_state, current_phase_key,
                                         phase_count, completed_phase_count)
        VALUES ($1, $2, $3, 'BUILD', 2, 'ACTIVE', 'SIGNED', 'construction', 1, 0)
-       ON CONFLICT (id) DO UPDATE SET kind = EXCLUDED.kind`,
+       ON CONFLICT (id) DO UPDATE SET kind = EXCLUDED.kind,
+             sort_order = EXCLUDED.sort_order,
+             lifecycle_status = EXCLUDED.lifecycle_status,
+             contract_state = EXCLUDED.contract_state,
+             current_phase_key = EXCLUDED.current_phase_key,
+             phase_count = EXCLUDED.phase_count,
+             completed_phase_count = EXCLUDED.completed_phase_count`,
       [IDS.buildEngagement, IDS.studio, IDS.project],
     );
 

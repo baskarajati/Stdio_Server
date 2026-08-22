@@ -24,6 +24,7 @@ import { registerContractRoutes } from './routes/contracts';
 import { registerDeprecatedRoutes } from './routes/deprecated';
 import { registerFinanceRoutes } from './routes/finance';
 import { registerInvoiceRoutes } from './routes/invoices';
+import { registerProjectRoutes } from './routes/projects';
 import { registerQuotationRoutes } from './routes/quotations';
 import { registerVariationOrderRoutes } from './routes/variation-orders';
 import { registerTaxRoutes } from './tax/routes';
@@ -126,6 +127,7 @@ export function createApp(pool: Pool) {
   // `withStudioTx`; the guarded writes additionally carry the idempotency and
   // entity-version guards (see `guards.ts`).
   registerContractRoutes(app, pool);
+  registerProjectRoutes(app, pool);
   registerQuotationRoutes(app, pool);
   registerVariationOrderRoutes(app, pool);
   registerInvoiceRoutes(app, pool);
