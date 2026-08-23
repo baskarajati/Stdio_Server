@@ -26,11 +26,11 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { seedDatabase } from '@stdio/db';
+import { applyMigrations } from '@stdio/db/testing';
 import type { Hono } from 'hono';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { applyMigrations } from '@stdio/db/testing';
-import { seedDatabase } from '@stdio/db';
 import { createApp, type ServerEnv } from './app';
 
 /** The concrete app type; never `ReturnType<typeof createApp>`. */
@@ -1048,6 +1048,72 @@ describe('SOL-25 issue operations and condition 3', () => {
     });
     expect(required.status).toBe(422);
     expect(problemCode(required.body)).toBe('TAX_CATALOG_TAG_REQUIRED');
+  });
+
+  it('SOL-133: stale confirmation text gets a typed 422 with current resolve correlates (C1, C5)', async () => {
+    const { tag, body: discovery } = await discover();
+    const rule = asRecord(asRecord(discovery.data).resolvedVerifiedRule);
+    const quotation = await createQuotationFixture();
+    const path = `/projects/${SEED_PROJECT}/quotations/${quotation.id}/send`;
+    const headers = (key: string) => ({
+      'x-businessapp-native-build': '2',
+      'x-request-id': randomUUID(),
+      'Idempotency-Key': key,
+      'If-Match': `W/"${quotation.entityVersion}"`,
+      'x-stdio-tax-catalog-tag': tag,
+      'content-type': 'application/json',
+    });
+
+    // (a) Stale text with a CURRENT catalog tag: the typed 422 carries the
+    // current resolve correlates (SOL-138 C1), byte-equal to resolve.
+    const stale = {
+      taxApplication: {
+        ...verifiedApplication(tag, 'stale text that no longer matches'),
+        lineSelections: [{ lineId: quotation.itemId, selected: true }],
+      },
+    };
+    const rejected = await request('POST', path, {
+      headers: headers(`key-stale-${randomUUID()}`),
+      body: stale,
+    });
+    expect(rejected.status).toBe(422);
+    expect(problemCode(rejected.body)).toBe('TAX_APPLICABILITY_CONFIRMATION_INVALID');
+    const details = asRecord(asRecord(rejected.body).details);
+    expect(details.applicabilityConfirmationText).toBe(rule.applicabilityConfirmationText);
+    expect(details.applicabilityConfirmationRuleId).toBe(rule.id);
+    expect(details.applicabilityConfirmationRuleVersion).toBe(rule.version);
+    expect(details.applicabilityConfirmationEntityVersion).toBe(rule.entityVersion);
+    expect(await countSnapshots(quotation.id)).toBe(0);
+
+    // (b) Retry with the details text and a FRESH key succeeds (C5b).
+    const freshKey = `key-fresh-${randomUUID()}`;
+    const retried = await request('POST', path, {
+      headers: headers(freshKey),
+      body: {
+        taxApplication: {
+          ...verifiedApplication(tag, details.applicabilityConfirmationText as string),
+          lineSelections: [{ lineId: quotation.itemId, selected: true }],
+        },
+      },
+    });
+    expect(retried.status).toBe(201);
+    expect(await countSnapshots(quotation.id)).toBe(1);
+
+    // (c) Reuse of that same key with a corrected body: 409
+    // IDEMPOTENCY_KEY_REUSED, and no second snapshot (C2, C5c). A corrected
+    // text is a NEW intent; the client must mint a fresh key.
+    const reused = await request('POST', path, {
+      headers: headers(freshKey),
+      body: {
+        taxApplication: {
+          ...verifiedApplication(tag, 'yet another different text'),
+          lineSelections: [{ lineId: quotation.itemId, selected: true }],
+        },
+      },
+    });
+    expect(reused.status).toBe(409);
+    expect(problemCode(reused.body)).toBe('IDEMPOTENCY_KEY_REUSED');
+    expect(await countSnapshots(quotation.id)).toBe(1);
   });
 
   it('returns 404 for the milestone invoice until the milestone register exists', async () => {
