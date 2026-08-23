@@ -74,6 +74,17 @@ docs/
   adr/        The architecture decision records.
 ```
 
+## The server trees
+
+Two repositories hold the server code. ADR 0003 records the full decision.
+
+| Repository | Role |
+| ---------- | ---- |
+| `baskarajati/Stdio_Server` | This monorepo: `apps/server`, `packages/core`, `packages/db`. The future home of every endpoint. |
+| `baskarajati/BusinessApp-DS-sol19` | The legacy Next.js server tree. It runs the tax surface today. Every push to `main` runs the CI gate. |
+
+Do not copy tax code from one tree into the other without a cutover issue.
+
 ## The API contract
 
 The API contract is `contracts/openapi/native-v1.yaml`. It is a verbatim
