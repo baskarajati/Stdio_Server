@@ -368,7 +368,13 @@ export function registerTimesheetRoutes(app: Hono<ServerEnv>, pool: Pool): void 
           },
         };
       },
-      { method: 'POST', path: c.req.path, flipReplayIdempotent: true, replayStatus: 200 },
+      {
+        requestId: c.get('requestId'),
+        method: 'POST',
+        path: c.req.path,
+        flipReplayIdempotent: true,
+        replayStatus: 200,
+      },
     );
 
     if (result.outcome === 'conflict') {
@@ -588,7 +594,13 @@ export function registerTimesheetRoutes(app: Hono<ServerEnv>, pool: Pool): void 
           },
         };
       },
-      { method: 'PATCH', path: c.req.path, flipReplayIdempotent: true, replayStatus: 200 },
+      {
+        requestId: c.get('requestId'),
+        method: 'PATCH',
+        path: c.req.path,
+        flipReplayIdempotent: true,
+        replayStatus: 200,
+      },
     );
 
     if (result.outcome === 'conflict') {
@@ -720,7 +732,13 @@ export function registerTimesheetRoutes(app: Hono<ServerEnv>, pool: Pool): void 
           },
         };
       },
-      { method: 'DELETE', path: c.req.path, flipReplayIdempotent: true, replayStatus: 200 },
+      {
+        requestId: c.get('requestId'),
+        method: 'DELETE',
+        path: c.req.path,
+        flipReplayIdempotent: true,
+        replayStatus: 200,
+      },
     );
 
     if (result.outcome === 'conflict') {

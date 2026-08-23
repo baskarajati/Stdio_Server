@@ -767,6 +767,7 @@ async function guardedTaxWrite(
         return { status: outcome.status, etag: outcome.etag, body: outcome.body };
       },
       {
+        requestId: c.get('requestId'),
         method: 'POST',
         path: routePath,
         flipReplayIdempotent: true,
@@ -1092,6 +1093,7 @@ async function issueOperation(
         };
       },
       {
+        requestId: c.get('requestId'),
         method: 'POST',
         path: routePath,
         flipReplayIdempotent: true,

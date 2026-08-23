@@ -66,6 +66,30 @@ async function mintToken(studioId: string, userId: string, value: string): Promi
 
 const auth = () => ({ Authorization: `Bearer ${token}` });
 
+/** The contract Problem envelope (components/schemas/Problem). */
+type ProblemEnvelope = {
+  type: string;
+  status: number;
+  code: string;
+  title: string;
+  detail: string;
+  requestId: string;
+  details?: { draftPreserved?: boolean; currentEntityVersion?: string | null };
+};
+
+/** Asserts the full contract Problem envelope on an error body (SOL-146). */
+function expectProblem(body: ProblemEnvelope, status: number, code: string): void {
+  expect(body.type).toBe('urn:stdio:error');
+  expect(body.status).toBe(status);
+  expect(body.code).toBe(code);
+  expect(typeof body.title).toBe('string');
+  expect(body.title.length).toBeGreaterThan(0);
+  expect(typeof body.detail).toBe('string');
+  expect(body.detail.length).toBeGreaterThan(0);
+  expect(typeof body.requestId).toBe('string');
+  expect(body.requestId.length).toBeGreaterThan(0);
+}
+
 beforeAll(async () => {
   pool = new Pool({ connectionString, max: 5 });
   app = createApp(pool);
@@ -280,6 +304,21 @@ describe('timesheet tenant boundary (SOL-69 condition 3)', () => {
       body: JSON.stringify(createBody({ userId: OTHER_USER })),
     });
     expect(res.status).toBe(404);
+    expectProblem((await res.json()) as ProblemEnvelope, 404, 'USER_NOT_FOUND');
+  });
+
+  it('SOL-146: wraps a missing-entry 404 on the update path in the full Problem', async () => {
+    const res = await app.request(`/timesheet-entries/${randomUUID()}`, {
+      method: 'PATCH',
+      headers: {
+        ...auth(),
+        'Idempotency-Key': `key-missing-entry-${randomUUID()}`,
+        'If-Match': `"${randomUUID()}"`,
+      },
+      body: JSON.stringify({ hours: '8.00' }),
+    });
+    expect(res.status).toBe(404);
+    expectProblem((await res.json()) as ProblemEnvelope, 404, 'TIMESHEET_ENTRY_NOT_FOUND');
   });
 });
 
@@ -358,10 +397,10 @@ describe('timesheet update and void', () => {
       body: JSON.stringify({ hours: '8.00' }),
     });
     expect(res.status).toBe(409);
-    const body = (await res.json()) as any;
-    expect(body.code).toBe('ENTITY_VERSION_CONFLICT');
-    expect(body.details.draftPreserved).toBe(true);
-    expect(body.details.currentEntityVersion).toBeTruthy();
+    const body = (await res.json()) as ProblemEnvelope;
+    expectProblem(body, 409, 'ENTITY_VERSION_CONFLICT');
+    expect(body.details?.draftPreserved).toBe(true);
+    expect(body.details?.currentEntityVersion).toBeTruthy();
   });
 
   it('locks an APPROVED entry (409, draft preserved)', async () => {
