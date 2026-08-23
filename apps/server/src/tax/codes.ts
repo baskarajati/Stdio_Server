@@ -153,13 +153,32 @@ export const taxAmountInvalid = (): TaxProblemSpec => ({
     'The discount must be non-negative and no greater than the consideration before discount.',
 });
 
-/** 422 — verified confirmation booleans or accepted text mismatch. */
-export const taxApplicabilityConfirmationInvalid = (): TaxProblemSpec => ({
+/** 422 — verified confirmation booleans or accepted text mismatch.
+ *
+ * SOL-133 (review SOL-138 condition C1): when this code is emitted with
+ * status 422, `details` carries the four recovery correlates — the current
+ * applicability text (byte-equal to the resolve response), the rule id, the
+ * rule version and the rule entity version. The client re-renders the text
+ * and re-issues with a fresh Idempotency-Key; reusing the failed key with a
+ * corrected body yields 409 IDEMPOTENCY_KEY_REUSED (condition C2).
+ */
+export const taxApplicabilityConfirmationInvalid = (correlates: {
+  ruleId: string;
+  ruleVersion: number;
+  entityVersion: string;
+  text: string;
+}): TaxProblemSpec => ({
   status: 422,
   code: 'TAX_APPLICABILITY_CONFIRMATION_INVALID',
   title: 'Tax applicability confirmation invalid',
   detail:
     'The applicability confirmation is missing, false, or its text differs from the resolved rule.',
+  details: {
+    applicabilityConfirmationText: correlates.text,
+    applicabilityConfirmationRuleId: correlates.ruleId,
+    applicabilityConfirmationRuleVersion: correlates.ruleVersion,
+    applicabilityConfirmationEntityVersion: correlates.entityVersion,
+  },
 });
 
 /** 422 — a required acknowledgment is missing or not accepted. */
