@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { pgTable, text, timestamp, unique, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { numeric, pgTable, text, timestamp, unique, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 
 /**
  * The tenant. Every other table carries `studioId` and is isolated by
@@ -33,6 +33,13 @@ export const users = pgTable(
     name: text('name').notNull(),
     /** One of OWNER, PM, DESIGNER, FINANCE, PROCUREMENT. */
     role: text('role').notNull(),
+    /**
+     * The person's hourly rate in IDR (SOL-19). Never projected to a PM
+     * (D-007): the timesheet entry snapshots it at create time and the
+     * budget report uses the snapshot only. Null means no rate; labour
+     * cost for that person is zero until a rate exists.
+     */
+    hourlyRate: numeric('hourly_rate', { precision: 20, scale: 4 }),
     /** Bumps on every write. The server serialises it as the ETag. */
     entityVersion: uuid('entity_version').notNull().defaultRandom(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().default(sql`now()`),

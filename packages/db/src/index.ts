@@ -10,4 +10,5 @@ export function createDatabase(connectionString: string) {
   return drizzle(pool, { schema, casing: 'snake_case' });
 }
 
+export { seedDatabase } from './seed';
 export { schema };

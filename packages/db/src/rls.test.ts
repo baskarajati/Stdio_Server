@@ -308,12 +308,18 @@ describe('money columns', () => {
     );
 
     expect(moneyColumns.rows.length).toBeGreaterThan(0);
+    // SOL-19 revision 6: `hourly_rate` and `effective_hourly_rate` are
+    // contract-mandated numeric(20,4) snapshots (proposal section 2.6), the
+    // same scale as quantities. Every other money column is numeric(20,2).
+    const FOUR_DP_RATE_COLUMNS = new Set(['hourly_rate', 'effective_hourly_rate']);
     expect(
       moneyColumns.rows.every(
         (column) =>
           column.data_type === 'numeric' &&
           column.numeric_precision === 20 &&
-          column.numeric_scale === 2,
+          (FOUR_DP_RATE_COLUMNS.has(column.column_name)
+            ? column.numeric_scale === 4
+            : column.numeric_scale === 2),
       ),
     ).toBe(true);
   });

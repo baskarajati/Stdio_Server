@@ -18,6 +18,7 @@ export * from './project-changes';
 export * from './projects';
 export * from './purchase-orders';
 export * from './quotations';
+export * from './spec-items';
 export * from './tax';
 export * from './timesheets';
 export * from './variation-orders';

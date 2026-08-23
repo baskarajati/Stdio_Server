@@ -1,8 +1,13 @@
 /**
  * Acceptance tests for the SOL-25 revision-24 tax surface (SOL-102).
  *
- * Runs against the live `stdio_dev` database (seed: Studio Contoh). Pins the
- * SOL-102 acceptance criteria and the highest-value revision-24 vectors:
+ * Runs against its own scratch database (SOL-134): the suite creates
+ * `stdio_tax_slice_<random>` from the admin `DATABASE_URL`, applies the
+ * migrations and the Studio Contoh seed, runs, and drops the database again.
+ * It never writes TEST- rows into the shared `stdio_dev` database.
+ *
+ * Pins the SOL-102 acceptance criteria and the highest-value revision-24
+ * vectors:
  *
  * - CONDITION 3 (CEO ruling): build 1 gets `426 NATIVE_BUILD_UPGRADE_REQUIRED`
  *   and never consumes the Idempotency-Key; a build-2 replay with the same
@@ -16,14 +21,15 @@
  *   (N23), guarded custom-rule writes (N37/N38/N59), supplier recordings
  *   (N39/N40/N57/N58), and the issue-operation build gate (N67/N68).
  *
- * Every test uses fresh fixture rows with a `TEST-` prefix and the suite
- * cleans them in `beforeAll`, so it is repeatable against the shared
- * database.
+ * Every test uses fresh fixture rows with a `TEST-` prefix; the scratch
+ * database makes the suite repeatable and isolates it from every other run.
  */
 
 import { randomUUID } from 'node:crypto';
+import { seedDatabase } from '@stdio/db';
+import { applyMigrations } from '@stdio/db/testing';
 import type { Hono } from 'hono';
-import { Pool } from 'pg';
+import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createApp, type ServerEnv } from './app';
 
@@ -41,8 +47,10 @@ function asRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
-const connectionString =
-  process.env.DATABASE_URL ?? 'postgres://stdio:stdio@localhost:5432/stdio_dev';
+/** Admin URL used only to create and drop this suite's scratch database. */
+const adminUrl = process.env.DATABASE_URL ?? 'postgres://stdio:stdio@localhost:5432/stdio_dev';
+const testDb = `stdio_tax_slice_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+const testUrl = adminUrl.replace(/\/[^/]+$/, `/${testDb}`);
 
 const SEED_STUDIO = '00000000-0000-4000-8000-000000000001';
 const SEED_OWNER = '00000000-0000-4000-8000-000000000002';
@@ -54,7 +62,7 @@ const OTHER_USER = '00000000-0000-4000-8000-0000000000bb';
 
 const BUILD_2 = '2';
 
-let pool: Pool;
+let pool: pg.Pool;
 let app: App;
 let token: string = '';
 let otherToken: string = '';
@@ -268,7 +276,15 @@ const customDraft = (overrides: Record<string, unknown> = {}) => ({
 });
 
 beforeAll(async () => {
-  pool = new Pool({ connectionString, max: 5 });
+  const creator = new pg.Client({ connectionString: adminUrl });
+  await creator.connect();
+  await creator.query(`CREATE DATABASE ${testDb}`);
+  await creator.end();
+
+  await applyMigrations(testUrl);
+  await seedDatabase(testUrl);
+
+  pool = new pg.Pool({ connectionString: testUrl, max: 5 });
   app = createApp(pool);
   token = `naa_test_${randomUUID()}`;
   otherToken = `naa_test_${randomUUID()}`;
@@ -310,7 +326,15 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await pool.end();
-});
+  const cleaner = new pg.Client({ connectionString: adminUrl });
+  await cleaner.connect();
+  await cleaner.query(
+    `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
+    [testDb],
+  );
+  await cleaner.query(`DROP DATABASE IF EXISTS ${testDb}`);
+  await cleaner.end();
+}, 30_000);
 
 describe('SOL-25 tax discovery', () => {
   it('resolves the verified rule for a date and returns the catalog ETag (N71)', async () => {
