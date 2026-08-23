@@ -594,6 +594,7 @@ async function guardedRegisterWrite(
   const raw = await c.req.text();
   const fingerprint = fingerprintFor(method, c.req.path, c.req.header('Content-Type') ?? null, raw);
   const result = await guardedWrite(pool, user, key, fingerprint, handler, {
+    requestId: c.get('requestId'),
     method,
     path: c.req.path,
     flipReplayIdempotent: true,

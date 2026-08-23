@@ -518,8 +518,13 @@ export function registerVariationOrderRoutes(app: Hono<ServerEnv>, pool: Pool): 
             };
           }
           if (change.status !== 'ELIGIBLE') {
+            // SOL-146: 409 is reserved for the MutationConflict oneOf
+            // (ENTITY_VERSION_CONFLICT / IDEMPOTENCY_KEY_REUSED). A change
+            // that cannot be approved is a 422 (declared on this route);
+            // the code stays undocumented-anywhere but the Problem schema
+            // leaves `code` free-form.
             return {
-              status: 409,
+              status: 422,
               body: {
                 code: 'PROJECT_CHANGE_NOT_ELIGIBLE',
                 detail: `The change status is ${change.status}; only ELIGIBLE changes can be approved and issued.`,
@@ -676,6 +681,7 @@ export function registerVariationOrderRoutes(app: Hono<ServerEnv>, pool: Pool): 
           };
         },
         {
+          requestId: c.get('requestId'),
           isolation: 'SERIALIZABLE',
           method: 'POST',
           path: c.req.path,
