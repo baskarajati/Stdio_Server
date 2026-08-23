@@ -66,8 +66,7 @@ function decimalFromMinor(minor: bigint, currency: string): string {
   return moneyToDecimal(money(minor, currency));
 }
 
-const UUID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Returns the first field in `fields` whose value is present but not a valid
@@ -75,10 +74,7 @@ const UUID_PATTERN =
  * fields that map to Postgres `uuid` columns, so a bad value never surfaces
  * as a bare 22P02 500 (SOL-131).
  */
-function firstInvalidUuid(
-  body: Record<string, unknown>,
-  fields: string[],
-): string | null {
+function firstInvalidUuid(body: Record<string, unknown>, fields: string[]): string | null {
   for (const field of fields) {
     const value = body[field];
     if (value === null || value === undefined) {
@@ -89,6 +85,44 @@ function firstInvalidUuid(
     }
   }
   return null;
+}
+
+/**
+ * Allocates the next per-studio variation-order display number (SOL-131,
+ * review SOL-137 condition).
+ *
+ * The number is derived numerically inside the studio-scoped transaction: a
+ * per-studio advisory lock serializes concurrent mints, so the read-then-
+ * write cannot race even across different Idempotency-Keys. The derivation
+ * scans `display_number` values that match `VO-<digits>` and takes the
+ * numeric max — never a lexical text MAX, which an unpadded value would
+ * break. The result is formatted `VO-%04d`. Gaps from aborted transactions
+ * are not violations (the aborted insert leaves no row, so the number is
+ * simply not consumed).
+ */
+async function nextVariationOrderDisplayNumber(scoped: Db, studioId: string): Promise<string> {
+  await scoped.db.execute(
+    sql`SELECT pg_advisory_xact_lock(hashtextextended(${studioId}::text, 47013))`,
+  );
+  const rows = await scoped.db
+    .select({ displayNumber: variationOrders.displayNumber })
+    .from(variationOrders)
+    .where(eq(variationOrders.studioId, studioId));
+  let max = 0;
+  for (const row of rows) {
+    if (row.displayNumber === null) {
+      continue;
+    }
+    const match = /^VO-(\d+)$/.exec(row.displayNumber);
+    if (!match) {
+      continue;
+    }
+    const n = Number(match[1]);
+    if (Number.isSafeInteger(n) && n > max) {
+      max = n;
+    }
+  }
+  return `VO-${String(max + 1).padStart(4, '0')}`;
 }
 
 /** Projects one variation-order row into the contract `VariationOrder` shape. */
@@ -566,14 +600,18 @@ export function registerVariationOrderRoutes(app: Hono<ServerEnv>, pool: Pool): 
           const now = new Date();
           const effectiveDate = req.effectiveDate ? new Date(req.effectiveDate as string) : now;
 
+          // SOL-131: number the document at issue (A-008) inside the
+          // studio-scoped transaction; systemNumber mirrors displayNumber.
+          const displayNumber = await nextVariationOrderDisplayNumber(scoped, scoped.studioId);
+
           const inserted = await scoped.db
             .insert(variationOrders)
             .values({
               studioId: scoped.studioId,
               projectId,
               engagementId,
-              displayNumber: null,
-              systemNumber: null,
+              displayNumber,
+              systemNumber: displayNumber,
               status: 'ISSUED',
               currency,
               issuedAt: now,

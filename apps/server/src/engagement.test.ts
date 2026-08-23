@@ -276,6 +276,12 @@ describe('engagement-scoped variation orders', () => {
     const payload = (await res.json()) as any;
     expect(payload.data.idempotentReplay).toBe(false);
     expect(payload.data.variationOrder.status).toBe('ISSUED');
+    // SOL-131: the minted document is numbered at issue (A-008), and both
+    // surfaces show the same stable identifier (SOL-137 condition).
+    expect(payload.data.variationOrder.displayNumber).toMatch(/^VO-\d{4}$/);
+    expect(payload.data.variationOrder.systemNumber).toBe(
+      payload.data.variationOrder.displayNumber,
+    );
     expect(payload.data.variationOrder.feeEffect).toBe('5000000.00');
     expect(payload.data.variationOrder.projectChange).toBeTruthy();
 
@@ -420,6 +426,86 @@ describe('engagement-scoped variation orders', () => {
     const payload = (await res.json()) as any;
     expect(payload.code).toBe('INVALID_UUID_FIELD');
     expect(payload.detail).toContain('scheduleOfValuesId');
+  });
+
+  it('SOL-131: allocates sequential per-studio display numbers', async () => {
+    // Two fresh eligible changes mint two VOs; the studio counter must
+    // advance strictly, independent of the seed baseline (VO-001) and of
+    // any other test's mints.
+    const mint = async () => {
+      const change = await createEligibleChange();
+      const engagementVersion = await readEngagementVersion();
+      const key = `vo_number_${randomUUID()}`;
+      const body = {
+        boqEffect: '10000000.00',
+        contractRevisionId: change.id,
+        effectiveDate: '2026-08-22T00:00:00Z',
+        feeEffect: '5000000.00',
+        scheduleOfValuesId: randomUUID(),
+      };
+      const res = await app.request(
+        `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/project-changes/${change.id}/variation-order`,
+        {
+          method: 'POST',
+          headers: {
+            ...auth(),
+            'Idempotency-Key': key,
+            'If-Match': `"${change.entityVersion}", "${engagementVersion}"`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(body),
+        },
+      );
+      expect(res.status).toBe(201);
+      const payload = (await res.json()) as any;
+      return payload.data.variationOrder.displayNumber as string;
+    };
+
+    const first = await mint();
+    const second = await mint();
+    expect(first).toMatch(/^VO-\d{4}$/);
+    expect(second).toMatch(/^VO-\d{4}$/);
+    expect(Number(second.slice(3))).toBe(Number(first.slice(3)) + 1);
+
+    // The register names the minted rows; there is no unnamed row any more.
+    const register = await app.request(
+      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/variation-orders`,
+      { headers: auth() },
+    );
+    expect(register.status).toBe(200);
+    const body = (await register.json()) as any;
+    const numbers = (body.data.variationOrders as any[])
+      .filter((v) => v.displayNumber === first || v.displayNumber === second)
+      .map((v) => v.displayNumber);
+    expect(numbers.sort()).toEqual([first, second].sort());
+
+    // Clean up the two minted rows so the suite's deterministic roll-up
+    // baseline (exactly two approved test VOs from the D-033 and replay
+    // tests) is restored for the project-finance roll-up test: delete the
+    // rows AND recompute the engagement transaction_price, which the mint
+    // moved forward (D-033) and which row deletion alone does not restore.
+    await tenantQuery(SEED_STUDIO, async (client) => {
+      await client.query(
+        `DELETE FROM variation_order_approvals
+         WHERE variation_order_id IN (
+           SELECT id FROM variation_orders
+           WHERE display_number = $1 OR display_number = $2
+         )`,
+        [first, second],
+      );
+      await client.query(
+        `DELETE FROM variation_orders WHERE display_number = $1 OR display_number = $2`,
+        [first, second],
+      );
+      await client.query(
+        `UPDATE project_engagements SET transaction_price =
+           '1000000000.00'::numeric +
+           COALESCE((SELECT sum(fee_effect::numeric) FROM variation_orders
+                     WHERE engagement_id = $1 AND status = 'ISSUED'), 0)
+         WHERE id = $1`,
+        [BUILD_ENGAGEMENT],
+      );
+    });
   });
 });
 
