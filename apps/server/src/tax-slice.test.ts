@@ -26,11 +26,11 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { seedDatabase } from '@stdio/db';
+import { applyMigrations } from '@stdio/db/testing';
 import type { Hono } from 'hono';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { applyMigrations } from '@stdio/db/testing';
-import { seedDatabase } from '@stdio/db';
 import { createApp, type ServerEnv } from './app';
 
 /** The concrete app type; never `ReturnType<typeof createApp>`. */

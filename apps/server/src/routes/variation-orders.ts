@@ -66,8 +66,7 @@ function decimalFromMinor(minor: bigint, currency: string): string {
   return moneyToDecimal(money(minor, currency));
 }
 
-const UUID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Returns the first field in `fields` whose value is present but not a valid
@@ -75,10 +74,7 @@ const UUID_PATTERN =
  * fields that map to Postgres `uuid` columns, so a bad value never surfaces
  * as a bare 22P02 500 (SOL-131).
  */
-function firstInvalidUuid(
-  body: Record<string, unknown>,
-  fields: string[],
-): string | null {
+function firstInvalidUuid(body: Record<string, unknown>, fields: string[]): string | null {
   for (const field of fields) {
     const value = body[field];
     if (value === null || value === undefined) {
