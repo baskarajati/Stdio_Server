@@ -295,8 +295,20 @@ describe('timesheet read', () => {
   });
 
   it('gets one entry and 404s a missing id', async () => {
-    const list = await app.request('/timesheet-entries?pageSize=1', { headers: auth() });
-    const entry = ((await list.json()) as any).data.entries[0];
+    // Read a row this suite owns. The register list is unordered, so a
+    // list-then-fetch of the first row races other suites that delete
+    // their own timesheet rows from the shared database in parallel.
+    const created = await app.request('/timesheet-entries', {
+      method: 'POST',
+      headers: {
+        ...auth(),
+        'Idempotency-Key': `key-read-${randomUUID()}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(createBody()),
+    });
+    expect(created.status).toBe(201);
+    const entry = ((await created.json()) as any).data.entry;
     const res = await app.request(`/timesheet-entries/${entry.id}`, { headers: auth() });
     expect(res.status).toBe(200);
     expect(((await res.json()) as any).data.entry.id).toBe(entry.id);
