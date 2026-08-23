@@ -110,6 +110,103 @@ export function problem(
 }
 
 /**
+ * True when `err` (or one of its `cause` chain) carries a five-character
+ * Postgres SQLSTATE. Drizzle wraps the `pg` `DatabaseError` in a
+ * `DrizzleQueryError` with the original in `.cause`, so the check walks the
+ * chain (SOL-131: the guarded-write 500 path must never surface as a bare
+ * error page).
+ */
+export function sqlStateOf(err: unknown): string | null {
+  let current: unknown = err;
+  for (let depth = 0; depth < 4 && current !== null && typeof current === 'object'; depth += 1) {
+    if (
+      'code' in current &&
+      typeof current.code === 'string' &&
+      /^[0-9A-Z]{5}$/.test(current.code)
+    ) {
+      return current.code;
+    }
+    if (!('cause' in current)) {
+      return null;
+    }
+    current = current.cause;
+  }
+  return null;
+}
+
+/**
+ * The typed Problem shape for one Postgres SQLSTATE (SOL-131 problem 3).
+ * Pure so it is unit-testable without a request context.
+ */
+export function sqlStateProblemShape(code: string): {
+  status: number;
+  code: string;
+  title: string;
+  detail: string;
+} {
+  switch (code) {
+    case '40001': // serialization_failure
+    case '40P01': // deadlock_detected
+      return {
+        status: 409,
+        code: 'CONCURRENT_WRITE_CONFLICT',
+        title: 'Concurrent write conflict',
+        detail:
+          'The write conflicted with a concurrent transaction. Retry with the same Idempotency-Key.',
+      };
+    case '23505': // unique_violation
+      return {
+        status: 409,
+        code: 'ENTITY_ALREADY_EXISTS',
+        title: 'Entity already exists',
+        detail: 'The write would create an entity that already exists.',
+      };
+    case '23503': // foreign_key_violation
+      return {
+        status: 422,
+        code: 'INVALID_REFERENCE',
+        title: 'Invalid reference',
+        detail: 'A referenced entity does not exist.',
+      };
+    case '23502': // not_null_violation
+      return {
+        status: 422,
+        code: 'INVALID_BODY',
+        title: 'Invalid request body',
+        detail: 'A required field is missing or empty.',
+      };
+    case '22P02': // invalid_text_representation
+    case '22P03':
+    case '22003':
+    case '22007':
+    case '22008':
+      return {
+        status: 422,
+        code: 'INVALID_FIELD_FORMAT',
+        title: 'Invalid field format',
+        detail: 'A field has an invalid format for its expected value.',
+      };
+    default:
+      return {
+        status: 500,
+        code: 'INTERNAL_ERROR',
+        title: 'Internal server error',
+        detail: 'The server could not complete the request.',
+      };
+  }
+}
+
+/**
+ * Maps an unexpected Postgres SQLSTATE to a typed Problem response, so a
+ * failed write is never a bare HTTP 500 with no `problem+json` body (SOL-131
+ * problem 3). Known client-correctable states become 4xx; everything else is
+ * a typed 500 `INTERNAL_ERROR` carrying the request id.
+ */
+export function problemFromSqlState(c: Context, code: string): Response {
+  return problem(c, { requestId: c.get('requestId'), ...sqlStateProblemShape(code) });
+}
+
+/**
  * The 426 the native release boundary emits (SOL-25 revision 24 section 9.9).
  * It fires BEFORE body validation and before the idempotency replay, so a
  * rejected attempt never consumes the Idempotency-Key. The `details` block

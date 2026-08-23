@@ -19,7 +19,7 @@ const { studios } = schema;
 import { projectCapabilities } from './capabilities';
 import { type RequestUser, withStudioTx } from './context/db';
 import { resolveToken, type TokenResolution } from './context/token';
-import { meta, problem } from './http';
+import { meta, problem, problemFromSqlState, sqlStateOf } from './http';
 import { registerBudgetRoutes } from './routes/budget';
 import { registerContractRoutes } from './routes/contracts';
 import { registerDeprecatedRoutes } from './routes/deprecated';
@@ -147,6 +147,28 @@ export function createApp(pool: Pool) {
   registerTimesheetRoutes(app, pool);
   registerTaxRoutes(app, pool);
   registerDeprecatedRoutes(app, pool);
+
+  // SOL-131 problem 3: an unexpected SQL state inside a route (guarded write
+  // or read) must surface as a typed Problem response, never a bare error
+  // page. Known client-correctable states become 4xx; everything else is a
+  // typed 500 INTERNAL_ERROR carrying the request id. The guarded-write
+  // transaction rolls back before this fires, so a same-key retry re-executes
+  // cleanly.
+  app.onError((err, c) => {
+    // eslint-disable-next-line no-console
+    console.error('onError query:', (err as { query?: string }).query);
+    const sqlState = sqlStateOf(err);
+    if (sqlState !== null) {
+      return problemFromSqlState(c, sqlState);
+    }
+    return problem(c, {
+      status: 500,
+      code: 'INTERNAL_ERROR',
+      title: 'Internal server error',
+      detail: 'The server could not complete the request.',
+      requestId: c.get('requestId'),
+    });
+  });
 
   return app;
 }
