@@ -26,6 +26,7 @@ import type { Pool } from 'pg';
 import type { ServerEnv } from '../app';
 import { projectCapabilities } from '../capabilities';
 import { type Db, withStudioTx } from '../context/db';
+import { nextDocumentNumber } from '../document-numbers';
 import {
   capabilityDenied,
   entityConflict,
@@ -64,6 +65,35 @@ function moneyInputToWire(raw: unknown, currency: string): string | null {
 /** The D-033 transaction-price string for a minor-unit sum. */
 function decimalFromMinor(minor: bigint, currency: string): string {
   return moneyToDecimal(money(minor, currency));
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** True for any non-null object; narrows a parsed-JSON body to a record. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+/**
+ * Returns the first field in `fields` whose value is present but not a valid
+ * UUID, or null when every field is a valid UUID, null, or absent. Used for
+ * fields that map to Postgres `uuid` columns, so a bad value never surfaces
+ * as a bare 22P02 500 (SOL-131).
+ */
+function firstInvalidUuid(body: unknown, fields: string[]): string | null {
+  if (!isRecord(body)) {
+    return null;
+  }
+  for (const field of fields) {
+    const value = body[field];
+    if (value === null || value === undefined) {
+      continue;
+    }
+    if (typeof value !== 'string' || !UUID_PATTERN.test(value)) {
+      return field;
+    }
+  }
+  return null;
 }
 
 /** Projects one variation-order row into the contract `VariationOrder` shape. */
@@ -435,6 +465,21 @@ export function registerVariationOrderRoutes(app: Hono<ServerEnv>, pool: Pool): 
         rawBody,
       );
 
+      // SOL-131: contractRevisionId and scheduleOfValuesId are uuid columns.
+      // A non-UUID value used to pass request validation and then die inside
+      // the transaction with Postgres 22P02, surfacing as a bare HTTP 500.
+      // Validate them up front so the caller gets a typed 422 instead.
+      const uuidFieldError = firstInvalidUuid(body, ['contractRevisionId', 'scheduleOfValuesId']);
+      if (uuidFieldError) {
+        return problem(c, {
+          status: 422,
+          code: 'INVALID_UUID_FIELD',
+          title: 'Invalid UUID field',
+          detail: `${uuidFieldError} must be a valid UUID (or null).`,
+          requestId: c.get('requestId'),
+        });
+      }
+
       const result = await guardedWrite(
         pool,
         user,
@@ -522,14 +567,20 @@ export function registerVariationOrderRoutes(app: Hono<ServerEnv>, pool: Pool): 
           const now = new Date();
           const effectiveDate = req.effectiveDate ? new Date(req.effectiveDate as string) : now;
 
+          // SOL-131 (SOL-137 C2, C3): number the document at issue. The
+          // per-studio VO counter is locked at transaction start; the number
+          // is allocated only now, after every validation gate, so a
+          // rejected write consumes no number (C4, C6).
+          const displayNumber = await nextDocumentNumber(scoped, 'VO');
+
           const inserted = await scoped.db
             .insert(variationOrders)
             .values({
               studioId: scoped.studioId,
               projectId,
               engagementId,
-              displayNumber: null,
-              systemNumber: null,
+              displayNumber,
+              systemNumber: displayNumber,
               status: 'ISSUED',
               currency,
               issuedAt: now,
@@ -641,6 +692,8 @@ export function registerVariationOrderRoutes(app: Hono<ServerEnv>, pool: Pool): 
           path: c.req.path,
           flipReplayIdempotent: true,
           replayStatus: 200,
+          numberingNamespace: 'VO',
+          retrySerialization: 3,
         },
       );
 
