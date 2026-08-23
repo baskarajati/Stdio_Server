@@ -33,8 +33,11 @@ non-`main` branch.
 - CI runs `.github/workflows/ci.yml` on a push or a pull request to `main`:
   `npm ci`, `prisma generate`, `prisma migrate deploy`, `tsc --noEmit`,
   `eslint`, the test suite, and the build.
-- `main` is protected: direct pushes are blocked and a green CI check is
-  required.
+- Every push to `main` runs the CI gate. The acceptance rule for the tree
+  is a green `CI / check` on the latest `main`.
+- GitHub-side blocking of direct pushes needs GitHub Pro or an organization
+  plan; the account is on GitHub Free. The block is recorded policy today
+  (SOL-112), with enforcement as a known follow-up.
 
 ## What this ADR does not decide
 
