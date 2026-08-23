@@ -191,6 +191,14 @@ async function cleanupFixtures(): Promise<void> {
     await client.query(`DELETE FROM purchase_order_items WHERE description LIKE 'BGT-%'`);
     await client.query(`DELETE FROM purchase_orders WHERE purchase_order_number LIKE 'BGT-%'`);
     await client.query(`DELETE FROM timesheet_entries WHERE notes = 'bgt-test'`);
+    // The fixture projects must go too, or they accumulate in the shared
+    // stdio_dev database and push the seed project off page 1 of
+    // GET /projects for other suites (SOL-72 re-verification found this).
+    await client.query(
+      `DELETE FROM project_engagements WHERE project_id IN
+         (SELECT id FROM projects WHERE project_code LIKE 'BGT-PRJ-%')`,
+    );
+    await client.query(`DELETE FROM projects WHERE project_code LIKE 'BGT-PRJ-%'`);
   });
 }
 
