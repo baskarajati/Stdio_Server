@@ -191,6 +191,30 @@ afterAll(async () => {
 
 const auth = () => ({ Authorization: `Bearer ${token}` });
 
+/** The contract Problem envelope (components/schemas/Problem). */
+type ProblemEnvelope = {
+  type: string;
+  status: number;
+  code: string;
+  title: string;
+  detail: string;
+  requestId: string;
+  details?: { draftPreserved?: boolean; currentEntityVersion?: string | null };
+};
+
+/** Asserts the full contract Problem envelope on an error body (SOL-146). */
+function expectProblem(body: ProblemEnvelope, status: number, code: string): void {
+  expect(body.type).toBe('urn:stdio:error');
+  expect(body.status).toBe(status);
+  expect(body.code).toBe(code);
+  expect(typeof body.title).toBe('string');
+  expect(body.title.length).toBeGreaterThan(0);
+  expect(typeof body.detail).toBe('string');
+  expect(body.detail.length).toBeGreaterThan(0);
+  expect(typeof body.requestId).toBe('string');
+  expect(body.requestId.length).toBeGreaterThan(0);
+}
+
 describe('engagement-scoped contracts', () => {
   it('lists the contract of one engagement', async () => {
     const res = await app.request(
@@ -400,7 +424,96 @@ describe('engagement-scoped variation orders', () => {
       },
     );
     expect(res.status).toBe(409);
-    expect(((await res.json()) as any).code).toBe('ENTITY_VERSION_CONFLICT');
+    const problem = (await res.json()) as ProblemEnvelope;
+    expectProblem(problem, 409, 'ENTITY_VERSION_CONFLICT');
+    expect(problem.details?.draftPreserved).toBe(true);
+    expect(problem.details?.currentEntityVersion).toBeTruthy();
+  });
+
+  it('SOL-146: wraps a missing engagement 404 on the write path in the full Problem', async () => {
+    const key = `vo_missing_eng_${randomUUID()}`;
+    const res = await app.request(
+      `/projects/${SEED_PROJECT}/engagements/${randomUUID()}/project-changes/${SEED_CHANGE}/variation-order`,
+      {
+        method: 'POST',
+        headers: {
+          ...auth(),
+          'Idempotency-Key': key,
+          'If-Match': `"${randomUUID()}", "${randomUUID()}"`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ feeEffect: '1000000.00' }),
+      },
+    );
+    expect(res.status).toBe(404);
+    expectProblem((await res.json()) as ProblemEnvelope, 404, 'ENGAGEMENT_NOT_FOUND');
+  });
+
+  it('SOL-146: wraps a missing change 404 on the write path in the full Problem', async () => {
+    const engagementVersion = await readEngagementVersion();
+    const key = `vo_missing_change_${randomUUID()}`;
+    const res = await app.request(
+      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/project-changes/${randomUUID()}/variation-order`,
+      {
+        method: 'POST',
+        headers: {
+          ...auth(),
+          'Idempotency-Key': key,
+          'If-Match': `"${randomUUID()}", "${engagementVersion}"`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ feeEffect: '1000000.00' }),
+      },
+    );
+    expect(res.status).toBe(404);
+    expectProblem((await res.json()) as ProblemEnvelope, 404, 'PROJECT_CHANGE_NOT_FOUND');
+  });
+
+  it('SOL-146: rejects a non-ELIGIBLE change with 422 PROJECT_CHANGE_NOT_ELIGIBLE', async () => {
+    const change = await createEligibleChange();
+    await tenantQuery(SEED_STUDIO, async (client) => {
+      await client.query(`UPDATE project_changes SET status = 'DRAFT' WHERE id = $1`, [change.id]);
+    });
+    const engagementVersion = await readEngagementVersion();
+    const key = `vo_not_eligible_${randomUUID()}`;
+    const res = await app.request(
+      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/project-changes/${change.id}/variation-order`,
+      {
+        method: 'POST',
+        headers: {
+          ...auth(),
+          'Idempotency-Key': key,
+          'If-Match': `"${change.entityVersion}", "${engagementVersion}"`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ feeEffect: '1000000.00', contractRevisionId: change.id }),
+      },
+    );
+    expect(res.status).toBe(422);
+    const body = (await res.json()) as ProblemEnvelope;
+    expectProblem(body, 422, 'PROJECT_CHANGE_NOT_ELIGIBLE');
+    expect(body.detail).toContain('DRAFT');
+  });
+
+  it('SOL-146: wraps a missing quotation engagement 404 in the full Problem', async () => {
+    const key = `qu_missing_eng_${randomUUID()}`;
+    const res = await app.request(
+      `/projects/${SEED_PROJECT}/engagements/${randomUUID()}/quotations`,
+      {
+        method: 'POST',
+        headers: {
+          ...auth(),
+          'Idempotency-Key': key,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          clientId: '00000000-0000-4000-8000-000000000003',
+          quotationNumber: 'Q-146',
+        }),
+      },
+    );
+    expect(res.status).toBe(404);
+    expectProblem((await res.json()) as ProblemEnvelope, 404, 'ENGAGEMENT_NOT_FOUND');
   });
 
   it('SOL-131 C1: concurrent mints on one studio get distinct numbers and full roll-ups', async () => {

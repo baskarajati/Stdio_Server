@@ -71,6 +71,30 @@ async function mintToken(studioId: string, userId: string, value: string): Promi
 const auth = () => ({ Authorization: `Bearer ${token}` });
 const idem = () => `idem-${randomUUID()}`;
 
+/** The contract Problem envelope (components/schemas/Problem). */
+type ProblemEnvelope = {
+  type: string;
+  status: number;
+  code: string;
+  title: string;
+  detail: string;
+  requestId: string;
+  details?: { draftPreserved?: boolean; currentEntityVersion?: string | null };
+};
+
+/** Asserts the full contract Problem envelope on an error body (SOL-146). */
+function expectProblem(body: ProblemEnvelope, status: number, code: string): void {
+  expect(body.type).toBe('urn:stdio:error');
+  expect(body.status).toBe(status);
+  expect(body.code).toBe(code);
+  expect(typeof body.title).toBe('string');
+  expect(body.title.length).toBeGreaterThan(0);
+  expect(typeof body.detail).toBe('string');
+  expect(body.detail.length).toBeGreaterThan(0);
+  expect(typeof body.requestId).toBe('string');
+  expect(body.requestId.length).toBeGreaterThan(0);
+}
+
 beforeAll(async () => {
   pool = new Pool({ connectionString, max: 5 });
   app = createApp(pool);
@@ -263,8 +287,18 @@ describe('client register writes', () => {
     });
     expect(stale.status).toBe(409);
     const conflict = (await stale.json()) as any;
-    expect(conflict.code).toBe('ENTITY_VERSION_CONFLICT');
+    expectProblem(conflict, 409, 'ENTITY_VERSION_CONFLICT');
     expect(conflict.details.draftPreserved).toBe(true);
+  });
+
+  it('SOL-146: wraps a missing-client 404 on the update path in the full Problem', async () => {
+    const res = await app.request(`/clients/${randomUUID()}`, {
+      method: 'PATCH',
+      headers: { ...auth(), 'Idempotency-Key': idem(), 'If-Match': `"${randomUUID()}"` },
+      body: JSON.stringify({ name: 'Tidak Ada' }),
+    });
+    expect(res.status).toBe(404);
+    expectProblem((await res.json()) as ProblemEnvelope, 404, 'CLIENT_NOT_FOUND');
   });
 });
 

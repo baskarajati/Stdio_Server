@@ -414,109 +414,116 @@ export function registerQuotationRoutes(app: Hono<ServerEnv>, pool: Pool): void 
       rawBody,
     );
 
-    const result = await guardedWrite(pool, user, key, fingerprint, async (scoped) => {
-      const engagement = await resolveEngagement(scoped, projectId, engagementId);
-      if (!engagement) {
-        return { status: 404, body: { code: 'ENGAGEMENT_NOT_FOUND' } };
-      }
-      const req = body as Record<string, unknown>;
-      const clientRows = await scoped.db
-        .select({ id: schema.clients.id })
-        .from(schema.clients)
-        .where(eq(schema.clients.id, req.clientId as string))
-        .limit(1);
-      const client = clientRows[0];
-      if (!client) {
+    const result = await guardedWrite(
+      pool,
+      user,
+      key,
+      fingerprint,
+      async (scoped) => {
+        const engagement = await resolveEngagement(scoped, projectId, engagementId);
+        if (!engagement) {
+          return { status: 404, body: { code: 'ENGAGEMENT_NOT_FOUND' } };
+        }
+        const req = body as Record<string, unknown>;
+        const clientRows = await scoped.db
+          .select({ id: schema.clients.id })
+          .from(schema.clients)
+          .where(eq(schema.clients.id, req.clientId as string))
+          .limit(1);
+        const client = clientRows[0];
+        if (!client) {
+          return {
+            status: 422,
+            body: { code: 'INVALID_CLIENT', detail: 'The client does not exist.' },
+          };
+        }
+
+        const now = new Date();
+        const inserted = await scoped.db
+          .insert(quotations)
+          .values({
+            studioId: scoped.studioId,
+            quotationNumber: req.quotationNumber as string,
+            title: (req.title as string) ?? 'Draft quotation',
+            clientId: client.id,
+            projectId,
+            engagementId,
+            version: '1',
+            status: 'DRAFT',
+            quotationType: (req.quotationType as string) ?? null,
+            feeModel: (req.feeModel as string) ?? null,
+            currency: (req.currency as string) ?? 'IDR',
+            quotationDate: req.quotationDate ? new Date(req.quotationDate as string) : now,
+            validUntil: req.validUntil ? new Date(req.validUntil as string) : null,
+          })
+          .returning({
+            id: quotations.id,
+            entityVersion: quotations.entityVersion,
+          });
+        const quotation = inserted[0];
+        if (!quotation) {
+          return {
+            status: 500,
+            body: { code: 'WRITE_FAILED', detail: 'The quotation row was not returned.' },
+          };
+        }
+
+        const feeItems = (req.feeItems as Record<string, unknown>[] | undefined) ?? [];
+        for (const [index, fee] of feeItems.entries()) {
+          const currency = (req.currency as string) ?? 'IDR';
+          const rate = moneyInputToColumn(fee.ratePerSqm, currency);
+          const quantity = String(fee.area ?? 0);
+          const lineTotal = rate
+            ? moneyToDecimal(
+                money(
+                  (parseMoneyInput(rate, currency).amount *
+                    BigInt(Math.round(Number(quantity) * 100))) /
+                    100n,
+                  currency,
+                ),
+              )
+            : null;
+          await scoped.db.insert(quotationItems).values({
+            studioId: scoped.studioId,
+            quotationId: quotation.id,
+            lineOrder: String(index + 1),
+            lineType: 'FEE',
+            code: (fee.code as string) ?? null,
+            description: (fee.label as string) ?? 'Fee',
+            unit: 'sqm',
+            quantity,
+            unitRate: rate,
+            lineSubtotal: lineTotal,
+            lineTaxAmount: null,
+            lineTotal,
+            sourceType: null,
+            sourceId: null,
+          });
+        }
+
+        const loaded = await loadQuotation(scoped, projectId, engagementId, quotation.id);
+        const item = loaded[0];
         return {
-          status: 422,
-          body: { code: 'INVALID_CLIENT', detail: 'The client does not exist.' },
-        };
-      }
-
-      const now = new Date();
-      const inserted = await scoped.db
-        .insert(quotations)
-        .values({
-          studioId: scoped.studioId,
-          quotationNumber: req.quotationNumber as string,
-          title: (req.title as string) ?? 'Draft quotation',
-          clientId: client.id,
-          projectId,
-          engagementId,
-          version: '1',
-          status: 'DRAFT',
-          quotationType: (req.quotationType as string) ?? null,
-          feeModel: (req.feeModel as string) ?? null,
-          currency: (req.currency as string) ?? 'IDR',
-          quotationDate: req.quotationDate ? new Date(req.quotationDate as string) : now,
-          validUntil: req.validUntil ? new Date(req.validUntil as string) : null,
-        })
-        .returning({
-          id: quotations.id,
-          entityVersion: quotations.entityVersion,
-        });
-      const quotation = inserted[0];
-      if (!quotation) {
-        return {
-          status: 500,
-          body: { code: 'WRITE_FAILED', detail: 'The quotation row was not returned.' },
-        };
-      }
-
-      const feeItems = (req.feeItems as Record<string, unknown>[] | undefined) ?? [];
-      for (const [index, fee] of feeItems.entries()) {
-        const currency = (req.currency as string) ?? 'IDR';
-        const rate = moneyInputToColumn(fee.ratePerSqm, currency);
-        const quantity = String(fee.area ?? 0);
-        const lineTotal = rate
-          ? moneyToDecimal(
-              money(
-                (parseMoneyInput(rate, currency).amount *
-                  BigInt(Math.round(Number(quantity) * 100))) /
-                  100n,
-                currency,
-              ),
-            )
-          : null;
-        await scoped.db.insert(quotationItems).values({
-          studioId: scoped.studioId,
-          quotationId: quotation.id,
-          lineOrder: String(index + 1),
-          lineType: 'FEE',
-          code: (fee.code as string) ?? null,
-          description: (fee.label as string) ?? 'Fee',
-          unit: 'sqm',
-          quantity,
-          unitRate: rate,
-          lineSubtotal: lineTotal,
-          lineTaxAmount: null,
-          lineTotal,
-          sourceType: null,
-          sourceId: null,
-        });
-      }
-
-      const loaded = await loadQuotation(scoped, projectId, engagementId, quotation.id);
-      const item = loaded[0];
-      return {
-        status: 201,
-        etag: quotation.entityVersion,
-        body: {
-          data: {
-            quotation: item
-              ? projectQuotation(
-                  item.row,
-                  projectCapabilities(user.role).canReadFinance?.enabled ?? false,
-                  item.feeItems,
-                  item.milestones,
-                )
-              : null,
-            reviewLink: null,
+          status: 201,
+          etag: quotation.entityVersion,
+          body: {
+            data: {
+              quotation: item
+                ? projectQuotation(
+                    item.row,
+                    projectCapabilities(user.role).canReadFinance?.enabled ?? false,
+                    item.feeItems,
+                    item.milestones,
+                  )
+                : null,
+              reviewLink: null,
+            },
+            meta: meta(c.get('requestId')),
           },
-          meta: meta(c.get('requestId')),
-        },
-      };
-    });
+        };
+      },
+      { requestId: c.get('requestId') },
+    );
 
     if (result.outcome === 'conflict') {
       if (result.code === 'IDEMPOTENCY_KEY_REUSED') {
@@ -590,120 +597,130 @@ export function registerQuotationRoutes(app: Hono<ServerEnv>, pool: Pool): void 
       rawBody,
     );
 
-    const result = await guardedWrite(pool, user, key, fingerprint, async (scoped) => {
-      const engagement = await resolveEngagement(scoped, projectId, engagementId);
-      if (!engagement) {
-        return { status: 404, body: { code: 'ENGAGEMENT_NOT_FOUND' } };
-      }
-      const current = await scoped.db
-        .select({
-          id: quotations.id,
-          entityVersion: quotations.entityVersion,
-          currency: quotations.currency,
-        })
-        .from(quotations)
-        .where(and(eq(quotations.id, quotationId), eq(quotations.engagementId, engagementId)))
-        .for('update')
-        .limit(1);
-      const quotation = current[0];
-      if (!quotation) {
-        return { status: 404, body: { code: 'QUOTATION_NOT_FOUND' } };
-      }
-      if (quotation.entityVersion !== quotationVersion) {
-        return {
-          status: 409,
-          body: { code: 'ENTITY_VERSION_CONFLICT', currentEntityVersion: quotation.entityVersion },
-        };
-      }
+    const result = await guardedWrite(
+      pool,
+      user,
+      key,
+      fingerprint,
+      async (scoped) => {
+        const engagement = await resolveEngagement(scoped, projectId, engagementId);
+        if (!engagement) {
+          return { status: 404, body: { code: 'ENGAGEMENT_NOT_FOUND' } };
+        }
+        const current = await scoped.db
+          .select({
+            id: quotations.id,
+            entityVersion: quotations.entityVersion,
+            currency: quotations.currency,
+          })
+          .from(quotations)
+          .where(and(eq(quotations.id, quotationId), eq(quotations.engagementId, engagementId)))
+          .for('update')
+          .limit(1);
+        const quotation = current[0];
+        if (!quotation) {
+          return { status: 404, body: { code: 'QUOTATION_NOT_FOUND' } };
+        }
+        if (quotation.entityVersion !== quotationVersion) {
+          return {
+            status: 409,
+            body: {
+              code: 'ENTITY_VERSION_CONFLICT',
+              currentEntityVersion: quotation.entityVersion,
+            },
+          };
+        }
 
-      const req = body as Record<string, unknown>;
-      const currency = quotation.currency ?? 'IDR';
-      const feeItems = (req.feeItems as Record<string, unknown>[] | undefined) ?? [];
+        const req = body as Record<string, unknown>;
+        const currency = quotation.currency ?? 'IDR';
+        const feeItems = (req.feeItems as Record<string, unknown>[] | undefined) ?? [];
 
-      await scoped.db.delete(quotationItems).where(eq(quotationItems.quotationId, quotation.id));
+        await scoped.db.delete(quotationItems).where(eq(quotationItems.quotationId, quotation.id));
 
-      for (const [index, fee] of feeItems.entries()) {
-        const rate = moneyInputToColumn(fee.ratePerSqm, currency);
-        const quantity = String(fee.area ?? 0);
-        const lineTotal = rate
-          ? moneyToDecimal(
-              money(
-                (parseMoneyInput(rate, currency).amount *
-                  BigInt(Math.round(Number(quantity) * 100))) /
-                  100n,
-                currency,
-              ),
-            )
-          : null;
-        await scoped.db.insert(quotationItems).values({
-          studioId: scoped.studioId,
-          quotationId: quotation.id,
-          lineOrder: String(index + 1),
-          lineType: 'FEE',
-          code: (fee.code as string) ?? null,
-          description: (fee.label as string) ?? 'Fee',
-          unit: 'sqm',
-          quantity,
-          unitRate: rate,
-          lineSubtotal: lineTotal,
-          lineTaxAmount: null,
-          lineTotal,
-          sourceType: null,
-          sourceId: null,
-        });
-      }
+        for (const [index, fee] of feeItems.entries()) {
+          const rate = moneyInputToColumn(fee.ratePerSqm, currency);
+          const quantity = String(fee.area ?? 0);
+          const lineTotal = rate
+            ? moneyToDecimal(
+                money(
+                  (parseMoneyInput(rate, currency).amount *
+                    BigInt(Math.round(Number(quantity) * 100))) /
+                    100n,
+                  currency,
+                ),
+              )
+            : null;
+          await scoped.db.insert(quotationItems).values({
+            studioId: scoped.studioId,
+            quotationId: quotation.id,
+            lineOrder: String(index + 1),
+            lineType: 'FEE',
+            code: (fee.code as string) ?? null,
+            description: (fee.label as string) ?? 'Fee',
+            unit: 'sqm',
+            quantity,
+            unitRate: rate,
+            lineSubtotal: lineTotal,
+            lineTaxAmount: null,
+            lineTotal,
+            sourceType: null,
+            sourceId: null,
+          });
+        }
 
-      // Recompute the quotation totals from the fee items (no tax in scope).
-      const totals = await scoped.db
-        .select({ subtotal: quotationItems.lineSubtotal })
-        .from(quotationItems)
-        .where(eq(quotationItems.quotationId, quotation.id));
-      const subtotalMinor = totals.reduce(
-        (acc, t) => acc + (t.subtotal ? parseMoneyInput(t.subtotal, currency).amount : 0n),
-        0n,
-      );
-      const discountMinor = req.discountAmount
-        ? parseMoneyInput(req.discountAmount as string | number, currency).amount
-        : 0n;
-      const totalMinor = subtotalMinor - discountMinor;
-      const subtotalText = moneyToDecimal(money(subtotalMinor, currency));
-      const discountText = moneyToDecimal(money(discountMinor, currency));
-      const totalText = moneyToDecimal(money(totalMinor, currency));
+        // Recompute the quotation totals from the fee items (no tax in scope).
+        const totals = await scoped.db
+          .select({ subtotal: quotationItems.lineSubtotal })
+          .from(quotationItems)
+          .where(eq(quotationItems.quotationId, quotation.id));
+        const subtotalMinor = totals.reduce(
+          (acc, t) => acc + (t.subtotal ? parseMoneyInput(t.subtotal, currency).amount : 0n),
+          0n,
+        );
+        const discountMinor = req.discountAmount
+          ? parseMoneyInput(req.discountAmount as string | number, currency).amount
+          : 0n;
+        const totalMinor = subtotalMinor - discountMinor;
+        const subtotalText = moneyToDecimal(money(subtotalMinor, currency));
+        const discountText = moneyToDecimal(money(discountMinor, currency));
+        const totalText = moneyToDecimal(money(totalMinor, currency));
 
-      await scoped.db
-        .update(quotations)
-        .set({
-          subtotalAmount: subtotalText,
-          discountAmount: discountText,
-          discountPercent: req.discountPercent
-            ? moneyToDecimal(parseMoneyInput(req.discountPercent as string | number, currency))
-            : null,
-          totalAmount: totalText,
-          entityVersion: sql`gen_random_uuid()`,
-        })
-        .where(eq(quotations.id, quotation.id));
-
-      const loaded = await loadQuotation(scoped, projectId, engagementId, quotation.id);
-      const item = loaded[0];
-      return {
-        status: 201,
-        etag: item?.row.entityVersion ?? null,
-        body: {
-          data: {
-            quotation: item
-              ? projectQuotation(
-                  item.row,
-                  projectCapabilities(user.role).canReadFinance?.enabled ?? false,
-                  item.feeItems,
-                  item.milestones,
-                )
+        await scoped.db
+          .update(quotations)
+          .set({
+            subtotalAmount: subtotalText,
+            discountAmount: discountText,
+            discountPercent: req.discountPercent
+              ? moneyToDecimal(parseMoneyInput(req.discountPercent as string | number, currency))
               : null,
-            reviewLink: null,
+            totalAmount: totalText,
+            entityVersion: sql`gen_random_uuid()`,
+          })
+          .where(eq(quotations.id, quotation.id));
+
+        const loaded = await loadQuotation(scoped, projectId, engagementId, quotation.id);
+        const item = loaded[0];
+        return {
+          status: 201,
+          etag: item?.row.entityVersion ?? null,
+          body: {
+            data: {
+              quotation: item
+                ? projectQuotation(
+                    item.row,
+                    projectCapabilities(user.role).canReadFinance?.enabled ?? false,
+                    item.feeItems,
+                    item.milestones,
+                  )
+                : null,
+              reviewLink: null,
+            },
+            meta: meta(c.get('requestId')),
           },
-          meta: meta(c.get('requestId')),
-        },
-      };
-    });
+        };
+      },
+      { requestId: c.get('requestId') },
+    );
 
     if (result.outcome === 'conflict') {
       if (result.code === 'IDEMPOTENCY_KEY_REUSED') {
@@ -768,63 +785,70 @@ export function registerQuotationRoutes(app: Hono<ServerEnv>, pool: Pool): void 
       rawBody,
     );
 
-    const result = await guardedWrite(pool, user, key, fingerprint, async (scoped) => {
-      const engagement = await resolveEngagement(scoped, projectId, engagementId);
-      if (!engagement) {
-        return { status: 404, body: { code: 'ENGAGEMENT_NOT_FOUND' } };
-      }
-      const current = await scoped.db
-        .select({
-          id: quotations.id,
-          entityVersion: quotations.entityVersion,
-        })
-        .from(quotations)
-        .where(and(eq(quotations.id, quotationId), eq(quotations.engagementId, engagementId)))
-        .for('update')
-        .limit(1);
-      const quotation = current[0];
-      if (!quotation) {
-        return { status: 404, body: { code: 'QUOTATION_NOT_FOUND' } };
-      }
-      if (quotation.entityVersion !== quotationVersion) {
+    const result = await guardedWrite(
+      pool,
+      user,
+      key,
+      fingerprint,
+      async (scoped) => {
+        const engagement = await resolveEngagement(scoped, projectId, engagementId);
+        if (!engagement) {
+          return { status: 404, body: { code: 'ENGAGEMENT_NOT_FOUND' } };
+        }
+        const current = await scoped.db
+          .select({
+            id: quotations.id,
+            entityVersion: quotations.entityVersion,
+          })
+          .from(quotations)
+          .where(and(eq(quotations.id, quotationId), eq(quotations.engagementId, engagementId)))
+          .for('update')
+          .limit(1);
+        const quotation = current[0];
+        if (!quotation) {
+          return { status: 404, body: { code: 'QUOTATION_NOT_FOUND' } };
+        }
+        if (quotation.entityVersion !== quotationVersion) {
+          return {
+            status: 409,
+            body: {
+              code: 'ENTITY_VERSION_CONFLICT',
+              currentEntityVersion: quotation.entityVersion,
+            },
+          };
+        }
+        await scoped.db
+          .update(quotations)
+          .set({
+            status: 'ACCEPTED',
+            lastAcceptedAt: new Date(),
+            entityVersion: sql`gen_random_uuid()`,
+          })
+          .where(eq(quotations.id, quotation.id));
+
+        const loaded = await loadQuotation(scoped, projectId, engagementId, quotation.id);
+        const item = loaded[0];
         return {
-          status: 409,
+          status: 201,
+          etag: item?.row.entityVersion ?? null,
           body: {
-            code: 'ENTITY_VERSION_CONFLICT',
-            currentEntityVersion: quotation.entityVersion,
+            data: {
+              quotation: item
+                ? projectQuotation(
+                    item.row,
+                    projectCapabilities(user.role).canReadFinance?.enabled ?? false,
+                    item.feeItems,
+                    item.milestones,
+                  )
+                : null,
+              reviewLink: null,
+            },
+            meta: meta(c.get('requestId')),
           },
         };
-      }
-      await scoped.db
-        .update(quotations)
-        .set({
-          status: 'ACCEPTED',
-          lastAcceptedAt: new Date(),
-          entityVersion: sql`gen_random_uuid()`,
-        })
-        .where(eq(quotations.id, quotation.id));
-
-      const loaded = await loadQuotation(scoped, projectId, engagementId, quotation.id);
-      const item = loaded[0];
-      return {
-        status: 201,
-        etag: item?.row.entityVersion ?? null,
-        body: {
-          data: {
-            quotation: item
-              ? projectQuotation(
-                  item.row,
-                  projectCapabilities(user.role).canReadFinance?.enabled ?? false,
-                  item.feeItems,
-                  item.milestones,
-                )
-              : null,
-            reviewLink: null,
-          },
-          meta: meta(c.get('requestId')),
-        },
-      };
-    });
+      },
+      { requestId: c.get('requestId') },
+    );
 
     if (result.outcome === 'conflict') {
       if (result.code === 'IDEMPOTENCY_KEY_REUSED') {

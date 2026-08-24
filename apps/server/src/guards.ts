@@ -164,6 +164,128 @@ export function capabilityDenied(c: Context, capability: Capability): Response {
 }
 
 /**
+ * The title/detail defaults for handler-level error codes (SOL-146). A
+ * handler that returns a bare `{code, ...}` body keeps its own `detail` when
+ * present; these defaults cover the codes the guarded-write routes emit.
+ */
+const HANDLER_PROBLEM_SPECS: Record<string, { title: string; detail: string }> = {
+  ENGAGEMENT_NOT_FOUND: {
+    title: 'Engagement not found',
+    detail: 'The engagement does not exist on this project.',
+  },
+  PROJECT_CHANGE_NOT_FOUND: {
+    title: 'Project change not found',
+    detail: 'The project change does not exist on this engagement.',
+  },
+  PROJECT_CHANGE_NOT_ELIGIBLE: {
+    title: 'Project change not eligible',
+    detail: 'Only ELIGIBLE changes can be approved and issued.',
+  },
+  QUOTATION_NOT_FOUND: {
+    title: 'Quotation not found',
+    detail: 'The quotation does not exist on this engagement.',
+  },
+  USER_NOT_FOUND: {
+    title: 'User not found',
+    detail: 'The user does not exist in this studio.',
+  },
+  CLIENT_NOT_FOUND: {
+    title: 'Client not found',
+    detail: 'The client does not exist in this studio.',
+  },
+  VENDOR_NOT_FOUND: {
+    title: 'Vendor not found',
+    detail: 'The vendor does not exist in this studio.',
+  },
+  PROJECT_NOT_FOUND: {
+    title: 'Project not found',
+    detail: 'The project does not exist in this studio.',
+  },
+  SPEC_ITEM_NOT_FOUND: {
+    title: 'Spec item not found',
+    detail: 'The spec item does not exist in this studio.',
+  },
+  TIMESHEET_ENTRY_NOT_FOUND: {
+    title: 'Timesheet entry not found',
+    detail: 'The timesheet entry does not exist in this studio.',
+  },
+  INVALID_CLIENT: {
+    title: 'Invalid client',
+    detail: 'The client reference is invalid.',
+  },
+  WRITE_FAILED: {
+    title: 'Write failed',
+    detail: 'The write did not complete; the server could not apply the change.',
+  },
+  ENTITY_VERSION_CONFLICT: {
+    title: 'Entity version conflict',
+    detail: 'The If-Match entity version does not match the current entity. Refetch and retry.',
+  },
+};
+
+/**
+ * Wraps a handler-level error result into the contract `Problem` envelope
+ * (SOL-146). The guard helpers (`entityConflict`, `idempotencyReused`,
+ * `capabilityDenied`) already emit the full envelope; a handler that returns
+ * a bare `{code, detail?, ...}` body on a non-2xx status used to be emitted
+ * verbatim. This wraps it so every non-2xx guarded-write body carries
+ * type/title/status/detail/code/requestId, with the remaining fields under
+ * `details`. A body that is already a full Problem passes through unchanged;
+ * success bodies (status < 400) pass through unchanged.
+ */
+export function handlerProblem(requestId: string, status: number, body: unknown): unknown {
+  if (status < 400) {
+    return body;
+  }
+  if (typeof body !== 'object' || body === null) {
+    return body;
+  }
+  const record = body as Record<string, unknown>;
+  if (
+    record.type === 'urn:stdio:error' &&
+    typeof record.code === 'string' &&
+    typeof record.requestId === 'string'
+  ) {
+    return body;
+  }
+  const code = typeof record.code === 'string' ? record.code : 'INTERNAL_ERROR';
+  const spec = HANDLER_PROBLEM_SPECS[code];
+  const details: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (
+      key === 'code' ||
+      key === 'detail' ||
+      key === 'status' ||
+      key === 'requestId' ||
+      key === 'title' ||
+      key === 'type'
+    ) {
+      continue;
+    }
+    details[key] = value;
+  }
+  if (code === 'ENTITY_VERSION_CONFLICT') {
+    // The contract's EntityVersionConflictProblem requires both fields.
+    details.draftPreserved = true;
+    if (!('currentEntityVersion' in details)) {
+      details.currentEntityVersion = null;
+    }
+  }
+  return {
+    type: 'urn:stdio:error',
+    title: spec?.title ?? 'Request failed',
+    status,
+    detail:
+      typeof record.detail === 'string'
+        ? record.detail
+        : (spec?.detail ?? 'The request could not be completed.'),
+    code,
+    requestId,
+    ...(Object.keys(details).length > 0 ? { details } : {}),
+  };
+}
+
+/**
  * Verifies an engagement belongs to the route's project inside this studio.
  * RLS already scopes the row to the studio; the application check binds the
  * engagement to the route project so a cross-engagement id is a 404, never a
@@ -224,6 +346,8 @@ export async function guardedWrite(
   fingerprint: string,
   handler: GuardedWriteHandler,
   options: {
+    /** The request id for the Problem envelope on handler-level errors (SOL-146). */
+    requestId: string;
     isolation?: 'SERIALIZABLE';
     /** The request method stored on the idempotency row (default POST). */
     method?: string;
@@ -300,7 +424,11 @@ export async function guardedWrite(
       }
 
       const result = await handler(scoped);
-      const bodyText = serializeJson(result.body);
+      // SOL-146: a handler-level error result is wrapped into the contract
+      // Problem envelope before it is stored, so the stored row and any
+      // replay carry the identical full envelope.
+      const responseBody = handlerProblem(options.requestId, result.status, result.body);
+      const bodyText = serializeJson(responseBody);
       await scoped.db.insert(idempotencyKeys).values({
         studioId: scoped.studioId,
         key,
@@ -322,6 +450,6 @@ export async function guardedWrite(
         replay: false,
       };
     },
-    options,
+    options.isolation ? { isolation: options.isolation } : {},
   );
 }
