@@ -381,7 +381,7 @@ export async function guardedWrite(
      * Defaults to 1 (no retry) for every other guarded write.
      */
     retrySerialization?: number;
-  } = {},
+  },
 ): Promise<GuardedWriteResult> {
   return withStudioTx(
     pool,
@@ -450,6 +450,9 @@ export async function guardedWrite(
         replay: false,
       };
     },
-    options.isolation ? { isolation: options.isolation } : {},
+    {
+      ...(options.isolation ? { isolation: options.isolation } : {}),
+      ...(options.retrySerialization ? { retrySerialization: options.retrySerialization } : {}),
+    },
   );
 }

@@ -539,9 +539,13 @@ describe('engagement-scoped variation orders', () => {
     const engagementB = randomUUID();
     await tenantQuery(SEED_STUDIO, async (client) => {
       for (const engagementId of [engagementA, engagementB]) {
+        // currentPhaseKey 'vo-cleanup-test' marks this row as a throwaway
+        // fixture; the cleanup at the end of the test removes every row with
+        // the marker, so aborted runs never leak engagements into the shared
+        // stdio_dev database (same pattern as budget.test.ts).
         await client.query(
-          `INSERT INTO project_engagements (id, studio_id, project_id, kind, contract_value)
-           VALUES ($1, $2, $3, 'DESIGN', '1000000000.00')`,
+          `INSERT INTO project_engagements (id, studio_id, project_id, kind, contract_value, current_phase_key)
+           VALUES ($1, $2, $3, 'DESIGN', '1000000000.00', 'vo-cleanup-test')`,
           [engagementId, SEED_STUDIO, SEED_PROJECT],
         );
       }
@@ -637,10 +641,19 @@ describe('engagement-scoped variation orders', () => {
         changeA.id,
         changeB.id,
       ]);
-      await client.query(`DELETE FROM project_engagements WHERE id IN ($1, $2)`, [
-        engagementA,
-        engagementB,
-      ]);
+      // Marker-based sweep: also removes rows from aborted runs of this
+      // test (an assertion failure before this block leaks them).
+      await client.query(
+        `DELETE FROM project_changes WHERE engagement_id IN
+           (SELECT id FROM project_engagements WHERE current_phase_key = 'vo-cleanup-test')`,
+      );
+      await client.query(
+        `DELETE FROM variation_orders WHERE engagement_id IN
+           (SELECT id FROM project_engagements WHERE current_phase_key = 'vo-cleanup-test')`,
+      );
+      await client.query(
+        `DELETE FROM project_engagements WHERE current_phase_key = 'vo-cleanup-test'`,
+      );
     });
   });
 
@@ -691,10 +704,13 @@ describe('engagement-scoped variation orders', () => {
     expect(statuses).toEqual([201, 409]);
     const winner = resA.status === 201 ? resA : resB;
     const loser = resA.status === 201 ? resB : resA;
-    const loserBody = (await loser.json()) as any;
+    // SOL-146: every guarded-write error body is the full Problem envelope;
+    // the refetch version lives in `details.currentEntityVersion`.
+    const loserBody = (await loser.json()) as ProblemEnvelope;
+    expect(loserBody.type).toBe('urn:stdio:error');
     expect(['CONCURRENT_WRITE_CONFLICT', 'ENTITY_VERSION_CONFLICT']).toContain(loserBody.code);
     if (loserBody.code === 'ENTITY_VERSION_CONFLICT') {
-      expect(loserBody.currentEntityVersion).toBeTruthy();
+      expect(loserBody.details?.currentEntityVersion).toBeTruthy();
     }
 
     // The winner minted exactly one numbered VO; the loser minted nothing.
