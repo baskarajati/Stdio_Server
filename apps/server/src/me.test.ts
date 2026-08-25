@@ -111,12 +111,12 @@ describe('GET /me', () => {
     // confirmation b6701b4e): quotation and variation-order writes are
     // enabled for the studio owner. The SOL-25 slice has merged (Founding
     // Engineer concurrence, SOL-107), so invoice draft and issue are enabled
-    // for the owner too. Payment recording stays permanently disabled
-    // (SOL-20, A-010).
+    // for the owner too. SOL-132 (CEO confirmation 79974dba, option B)
+    // enables the split-payment write for the owner.
     expect(body.data.capabilities.canWriteVariationOrder.enabled).toBe(true);
     expect(body.data.capabilities.canWriteInvoiceDraft.enabled).toBe(true);
     expect(body.data.capabilities.canIssueInvoice.enabled).toBe(true);
-    expect(body.data.capabilities.canRecordInvoicePayment.enabled).toBe(false);
+    expect(body.data.capabilities.canRecordInvoicePayment.enabled).toBe(true);
 
     expect(body.meta.apiVersion).toBe('2026-06-23');
     expect(body.meta.requestId).toBeTruthy();

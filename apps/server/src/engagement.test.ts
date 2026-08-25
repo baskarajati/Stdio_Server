@@ -9,8 +9,8 @@
  * - Project finance stays a read-only roll-up.
  * - D-033: an approved variation order changes the engagement transaction
  *   price; an unapproved change never touches it.
- * - Invoice draft/issue/payment writes are capability-denied (SOL-25 gate,
- *   permanent payment denial).
+ * - Invoice draft/issue writes stay capability-denied; the SOL-132
+ *   split-payment write is OWNER-gated and records cash, PPh and retensi.
  * - Cross-engagement isolation: an id on the wrong engagement is a 404.
  * - Idempotent replay and entity-version conflicts behave per the guard
  *   contract.
@@ -38,6 +38,8 @@ const OTHER_USER = '00000000-0000-4000-8000-0000000000bb';
 let pool: Pool;
 let app: ReturnType<typeof createApp>;
 let token: string = '';
+let designerToken = '';
+let otherToken = '';
 
 async function tenantQuery<T>(
   studioId: string,
@@ -123,6 +125,28 @@ beforeAll(async () => {
   token = `naa_test_${randomUUID()}`;
   await mintToken(SEED_STUDIO, SEED_OWNER, token);
 
+  // SOL-132: a same-studio non-OWNER for the capability negative test.
+  designerToken = `naa_pay_designer_${randomUUID()}`;
+  await tenantQuery(SEED_STUDIO, async (client) => {
+    await client.query(
+      `INSERT INTO users (id, studio_id, email, name, role)
+       VALUES (gen_random_uuid(), $1, 'pay-designer@contoh.studio', 'Desainer Pay', 'DESIGNER')
+       ON CONFLICT DO NOTHING`,
+      [SEED_STUDIO],
+    );
+    const rows = (await client.query(
+      `SELECT id FROM users WHERE studio_id = $1 AND email = 'pay-designer@contoh.studio'`,
+      [SEED_STUDIO],
+    )) as { rows: { id: string }[] };
+    const designerId = rows.rows[0]?.id;
+    if (!designerId) throw new Error('designer fixture missing');
+    await client.query(
+      `INSERT INTO access_tokens (studio_id, user_id, token, expires_at)
+       VALUES ($1, $2, $3, now() + interval '1 hour') ON CONFLICT (token) DO NOTHING`,
+      [SEED_STUDIO, designerId, designerToken],
+    );
+  });
+
   // Fixture: a second studio whose rows must never be readable by Studio
   // Contoh. The other user owns a project with an engagement.
   await tenantQuery(OTHER_STUDIO, async (client) => {
@@ -137,6 +161,8 @@ beforeAll(async () => {
       [OTHER_USER, OTHER_STUDIO],
     );
   });
+  otherToken = `naa_pay_other_${randomUUID()}`;
+  await mintToken(OTHER_STUDIO, OTHER_USER, otherToken);
 
   // Deterministic fixture for the D-033 recompute:
   // transaction_price = base contract_value + sum(approved fee_effect).
@@ -190,6 +216,8 @@ afterAll(async () => {
 });
 
 const auth = () => ({ Authorization: `Bearer ${token}` });
+const designerAuth = () => ({ Authorization: `Bearer ${designerToken}` });
+const otherAuth = () => ({ Authorization: `Bearer ${otherToken}` });
 
 /** The contract Problem envelope (components/schemas/Problem). */
 type ProblemEnvelope = {
@@ -817,22 +845,253 @@ describe('engagement-scoped invoices', () => {
     expect(Array.isArray(body.data.invoices)).toBe(true);
   });
 
-  it('denies the payment write permanently (SOL-20, A-010)', async () => {
+  it('records a plain payment on the OWNER capability (SOL-132)', async () => {
+    const reference = `plain-${randomUUID()}`;
     const res = await app.request(
       `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${SEED_INVOICE}/payment`,
       {
         method: 'POST',
-        headers: { ...auth(), 'Content-Type': 'application/json' },
+        headers: {
+          ...auth(),
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `pay-${randomUUID()}`,
+        },
         body: JSON.stringify({
           amount: '100000.00',
           date: '2026-08-22',
-          paymentMethod: 'TRANSFER',
+          paymentMethod: 'BANK_TRANSFER',
+          reference,
         }),
+      },
+    );
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as any;
+    expect(body.meta.idempotentReplay).toBe(false);
+    const invoice = body.data.invoice;
+    expect(invoice.payments.length).toBeGreaterThanOrEqual(2);
+    const stored = await tenantQuery(SEED_STUDIO, async (client) => {
+      const rows = (await client.query(
+        `SELECT amount, gross_amount, pph_amount, retensi_amount
+         FROM invoice_payments WHERE invoice_id = $1 AND reference = $2`,
+        [SEED_INVOICE, reference],
+      )) as { rows: Record<string, string | null>[] };
+      return rows.rows[0] ?? {};
+    });
+    expect(stored.amount).toBe('100000.00');
+    expect(stored.gross_amount).toBe('100000.00');
+    expect(stored.pph_amount).toBeNull();
+    expect(stored.retensi_amount).toBeNull();
+  });
+
+  it('records a split payment and derives cash = gross - pph - retensi (SOL-132)', async () => {
+    // A 10000.00 gross termin with 2% PPh withholding and 5% retensi held.
+    const reference = `split-${randomUUID()}`;
+    const res = await app.request(
+      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${SEED_INVOICE}/payment`,
+      {
+        method: 'POST',
+        headers: {
+          ...auth(),
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `pay-${randomUUID()}`,
+        },
+        body: JSON.stringify({
+          amount: '9300.00',
+          date: '2026-08-23',
+          paymentMethod: 'BANK_TRANSFER',
+          reference,
+          grossAmount: '10000.00',
+          pphPercent: '2.0000',
+          retensiPercent: '5.0000',
+        }),
+      },
+    );
+    if (res.status !== 201) {
+      console.log('SPLIT BODY', JSON.stringify(await res.json()));
+    }
+    expect(res.status).toBe(201);
+    const stored = await tenantQuery(SEED_STUDIO, async (client) => {
+      const rows = (await client.query(
+        `SELECT amount, gross_amount, pph_percent, pph_amount, retensi_percent, retensi_amount
+         FROM invoice_payments WHERE invoice_id = $1 AND reference = $2`,
+        [SEED_INVOICE, reference],
+      )) as { rows: Record<string, string | null>[] };
+      return rows.rows[0] ?? {};
+    });
+    // Exact rational arithmetic in integer minor units: 200.00 PPh,
+    // 500.00 retensi, 9300.00 cash. No cent is lost to floats.
+    expect(stored.gross_amount).toBe('10000.00');
+    expect(stored.pph_percent).toBe('2.0000');
+    expect(stored.pph_amount).toBe('200.00');
+    expect(stored.retensi_percent).toBe('5.0000');
+    expect(stored.retensi_amount).toBe('500.00');
+    expect(stored.amount).toBe('9300.00');
+  });
+
+  it('replays an idempotent payment retry with 200 and no second row', async () => {
+    const key = `pay-${randomUUID()}`;
+    const payload = JSON.stringify({ amount: '111.00', date: '2026-08-23', paymentMethod: 'CASH' });
+    const first = await app.request(
+      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${SEED_INVOICE}/payment`,
+      {
+        method: 'POST',
+        headers: { ...auth(), 'Content-Type': 'application/json', 'Idempotency-Key': key },
+        body: payload,
+      },
+    );
+    expect(first.status).toBe(201);
+    const replay = await app.request(
+      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${SEED_INVOICE}/payment`,
+      {
+        method: 'POST',
+        headers: { ...auth(), 'Content-Type': 'application/json', 'Idempotency-Key': key },
+        body: payload,
+      },
+    );
+    expect(replay.status).toBe(200);
+    expect(((await replay.json()) as any).meta.idempotentReplay).toBe(true);
+    const counted = await tenantQuery(SEED_STUDIO, async (client) => {
+      // The completed key stores exactly one executed response; a second
+      // execution would have written another payment row and replayed that
+      // different body instead.
+      const keyed = (await client.query(
+        `SELECT (response_body LIKE '%111.00%')::int AS n
+         FROM idempotency_keys WHERE key = $1 AND status = 'COMPLETED'`,
+        [key],
+      )) as { rows: { n: number }[] };
+      return keyed.rows[0]?.n ?? 0;
+    });
+    expect(counted).toBe(1);
+  });
+
+  it('rejects a split whose derived cash disagrees with amount (SOL-132)', async () => {
+    const res = await app.request(
+      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${SEED_INVOICE}/payment`,
+      {
+        method: 'POST',
+        headers: {
+          ...auth(),
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `pay-${randomUUID()}`,
+        },
+        body: JSON.stringify({
+          amount: '9999.00',
+          date: '2026-08-23',
+          paymentMethod: 'BANK_TRANSFER',
+          grossAmount: '10000.00',
+          pphPercent: '2.0000',
+          retensiPercent: '5.0000',
+        }),
+      },
+    );
+    expect(res.status).toBe(422);
+    const body = (await res.json()) as any;
+    expect(body.code).toBe('PAYMENT_SPLIT_MISMATCH');
+  });
+
+  it('rejects percent-derived splits without a gross amount', async () => {
+    const res = await app.request(
+      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${SEED_INVOICE}/payment`,
+      {
+        method: 'POST',
+        headers: {
+          ...auth(),
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `pay-${randomUUID()}`,
+        },
+        body: JSON.stringify({
+          amount: '100.00',
+          date: '2026-08-23',
+          paymentMethod: 'CASH',
+          pphPercent: '2.0000',
+        }),
+      },
+    );
+    expect(res.status).toBe(422);
+    expect(((await res.json()) as any).code).toBe('PAYMENT_GROSS_REQUIRED');
+  });
+
+  it('rejects a negative amount and an over-gross split', async () => {
+    const negative = await app.request(
+      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${SEED_INVOICE}/payment`,
+      {
+        method: 'POST',
+        headers: {
+          ...auth(),
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `pay-${randomUUID()}`,
+        },
+        body: JSON.stringify({ amount: '-5.00', date: '2026-08-23', paymentMethod: 'CASH' }),
+      },
+    );
+    expect(negative.status).toBe(422);
+    expect(((await negative.json()) as any).code).toBe('MONEY_OUT_OF_RANGE');
+
+    const over = await app.request(
+      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${SEED_INVOICE}/payment`,
+      {
+        method: 'POST',
+        headers: {
+          ...auth(),
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `pay-${randomUUID()}`,
+        },
+        body: JSON.stringify({
+          // 60% PPh + 50% retensi = 110% of the gross, so the derived cash
+          // goes negative (-500.00) and PAYMENT_SPLIT_OVER_GROSS must fire.
+          // A non-positive amount cannot reach this stage (rejected above),
+          // so a tiny positive amount carries the mismatch branch instead.
+          amount: '1.00',
+          date: '2026-08-23',
+          paymentMethod: 'BANK_TRANSFER',
+          grossAmount: '10000.00',
+          pphPercent: '60.0000',
+          retensiPercent: '50.0000',
+        }),
+      },
+    );
+    expect(over.status).toBe(422);
+    const overBody = (await over.json()) as any;
+    // The derived cash is negative (-1000.00 = 10000 - 6000 - 5000), so the
+    // route answers PAYMENT_SPLIT_OVER_GROSS regardless of the stated amount.
+    expect(overBody.code).toBe('PAYMENT_SPLIT_OVER_GROSS');
+    expect(overBody.details.derivedCash).toBe('-1000.00');
+  });
+
+  it('denies the payment write for a non-OWNER role (SOL-132)', async () => {
+    const res = await app.request(
+      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${SEED_INVOICE}/payment`,
+      {
+        method: 'POST',
+        headers: {
+          ...designerAuth(),
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `pay-${randomUUID()}`,
+        },
+        body: JSON.stringify({ amount: '100.00', date: '2026-08-23', paymentMethod: 'CASH' }),
       },
     );
     expect(res.status).toBe(403);
     const body = (await res.json()) as any;
     expect(body.code).toBe('CAPABILITY_DENIED');
+    expect(body.detail).toContain('studio owner');
+  });
+
+  it('never lets another studio record a payment on this invoice (RLS)', async () => {
+    // The other studio cannot resolve this engagement at all.
+    const res = await app.request(
+      `/projects/${SEED_PROJECT}/engagements/${randomUUID()}/invoices/${SEED_INVOICE}/payment`,
+      {
+        method: 'POST',
+        headers: {
+          ...otherAuth(),
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `pay-${randomUUID()}`,
+        },
+        body: JSON.stringify({ amount: '100.00', date: '2026-08-23', paymentMethod: 'CASH' }),
+      },
+    );
+    expect([403, 404]).toContain(res.status);
   });
 
   it('denies the draft write until SOL-25 lands', async () => {

@@ -3,18 +3,26 @@
  *
  * Invoice reads and collection-control metadata are engagement-scoped and
  * open. Invoice draft and issue writes carry the SOL-25 tax snapshot contract
- * and stay capability-disabled until SOL-25's approved contract lands
- * (`canWriteInvoiceDraft`, `canIssueInvoice`). Payment recording stays
- * permanently disabled (SOL-20, A-010): the amount/date/method payload cannot
- * represent cash, PPh, and retensi separately, so `canRecordInvoicePayment`
- * is false and the write returns `403` with the reason.
+ * and stay capability-denied until SOL-25's approved contract lands
+ * (`canWriteInvoiceDraft`, `canIssueInvoice`). The SOL-132 split-payment
+ * write (CEO confirmation `79974dba`, option B) is OWNER-gated: it records
+ * gross settled, PPh percent withheld, retensi percent held and the exact
+ * cash that arrived on one row of `invoice_payments`.
  *
  * Money wire: `ProjectFinanceInvoice` declares NUMBER-form money, so the
  * server emits `RawDecimal` via `serializeJson` and derives the `*Label`
  * twins from the same `numeric(20,2)` value.
  */
 
-import { money, moneyFromDecimal, moneyToDecimal } from '@stdio/core';
+import {
+  divideRounded,
+  MoneyInputError,
+  money,
+  moneyFromDecimal,
+  moneyOutput,
+  moneyToDecimal,
+  parseStrictMoneyInput,
+} from '@stdio/core';
 import { schema } from '@stdio/db';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import type { Hono } from 'hono';
@@ -22,7 +30,14 @@ import type { Pool } from 'pg';
 import type { ServerEnv } from '../app';
 import { projectCapabilities } from '../capabilities';
 import { type Db, withStudioTx } from '../context/db';
-import { capabilityDenied, resolveEngagement } from '../guards';
+import {
+  capabilityDenied,
+  fingerprintFor,
+  guardedWrite,
+  idempotencyReused,
+  requireIdempotencyKey,
+  resolveEngagement,
+} from '../guards';
 import { etagFor, meta, problem } from '../http';
 import { jsonResponse, moneyNumber, RawDecimal } from '../money';
 import { dateLabel, moneyLabel, statusLabel } from '../projections';
@@ -449,11 +464,307 @@ export function registerInvoiceRoutes(app: Hono<ServerEnv>, pool: Pool): void {
   });
 
   // POST /projects/{id}/engagements/{engId}/invoices/{invoiceId}/payment
-  // — permanently disabled (SOL-20 defers PPh; A-010 leaves retensi timing to
-  // an accountant). The amount/date/method payload cannot represent cash, PPh,
-  // and retensi separately.
+  // — SOL-132 split-payment write (CEO confirmation `79974dba`, option B).
+  // The payload carries the cash that arrived plus an optional gross /
+  // PPh-percent / retensi-percent split; the server derives the withheld
+  // parts in exact integer minor units and stores all of them on one row.
   app.post('/projects/:id/engagements/:engId/invoices/:invoiceId/payment', async (c) => {
-    const capability = projectCapabilities(c.get('user').role).canRecordInvoicePayment;
-    return capabilityDenied(c, capability);
+    const user = c.get('user');
+    const projectId = c.req.param('id');
+    const engagementId = c.req.param('engId');
+    const invoiceId = c.req.param('invoiceId');
+
+    const capability = projectCapabilities(user.role).canRecordInvoicePayment;
+    if (!capability.enabled) {
+      return capabilityDenied(c, capability);
+    }
+    const key = requireIdempotencyKey(c);
+    if (typeof key !== 'string') {
+      return key;
+    }
+
+    const rawBody = await c.req.text();
+    let body: unknown;
+    try {
+      body = JSON.parse(rawBody);
+    } catch {
+      return problem(c, {
+        status: 400,
+        code: 'INVALID_JSON',
+        title: 'Invalid JSON body',
+        detail: 'The request body is not valid JSON.',
+        requestId: c.get('requestId'),
+      });
+    }
+    const req = (body ?? {}) as Record<string, unknown>;
+    const fingerprint = fingerprintFor(
+      'POST',
+      c.req.path,
+      c.req.header('Content-Type') ?? null,
+      rawBody,
+    );
+
+    const result = await guardedWrite(
+      pool,
+      user,
+      key,
+      fingerprint,
+      async (scoped) => {
+        const engagement = await resolveEngagement(scoped, projectId, engagementId);
+        if (!engagement) {
+          return {
+            status: 404,
+            body: {
+              code: 'ENGAGEMENT_NOT_FOUND',
+              detail: 'The engagement does not exist on this project.',
+            },
+          };
+        }
+        const invoices_ = await scoped.db
+          .select({ id: invoices.id })
+          .from(invoices)
+          .where(and(eq(invoices.id, invoiceId), eq(invoices.engagementId, engagementId)))
+          .for('update')
+          .limit(1);
+        const invoice = invoices_[0];
+        if (!invoice) {
+          return {
+            status: 404,
+            body: {
+              code: 'INVOICE_NOT_FOUND',
+              detail: 'The invoice does not exist on this engagement.',
+            },
+          };
+        }
+        // --- Money stage: strict parse, then exact rational derivation. ---
+        if (typeof req.amount !== 'string' && typeof req.amount !== 'number') {
+          return {
+            status: 422,
+            body: moneyInvalid('amount must be a string or a number.'),
+          };
+        }
+        let amountMinor: bigint;
+        try {
+          amountMinor = parseStrictMoneyInput(req.amount as string | number);
+        } catch (error) {
+          return { status: 422, body: moneyFromError(error) };
+        }
+        if (amountMinor <= 0n) {
+          return {
+            status: 422,
+            body: {
+              code: 'MONEY_OUT_OF_RANGE',
+              detail: 'amount must be greater than zero.',
+            },
+          };
+        }
+        if (typeof req.date !== 'string' || Number.isNaN(Date.parse(req.date))) {
+          return {
+            status: 422,
+            body: {
+              code: 'PAYMENT_DATE_INVALID',
+              detail: 'date must be an ISO 8601 date or timestamp.',
+            },
+          };
+        }
+
+        const hasSplit =
+          req.grossAmount !== undefined ||
+          req.pphPercent !== undefined ||
+          req.retensiPercent !== undefined;
+        let grossMinor = amountMinor;
+        let pphAmountMinor = 0n;
+        let pphPercentText: string | null = null;
+        let retensiAmountMinor = 0n;
+        let retensiPercentText: string | null = null;
+
+        if (hasSplit) {
+          if (req.grossAmount === undefined) {
+            return {
+              status: 422,
+              body: {
+                code: 'PAYMENT_GROSS_REQUIRED',
+                detail:
+                  'A percent split requires grossAmount; the percent applies to the settled gross.',
+              },
+            };
+          }
+          try {
+            grossMinor = parseStrictMoneyInput(req.grossAmount as string | number);
+          } catch (error) {
+            return { status: 422, body: moneyFromError(error) };
+          }
+          for (const [field, target] of [
+            ['pphPercent', 'pph'],
+            ['retensiPercent', 'retensi'],
+          ] as const) {
+            const raw = req[field];
+            if (raw === undefined) continue;
+            let percentText: string;
+            if (typeof raw === 'string') {
+              percentText = raw;
+            } else if (typeof raw === 'number' && Number.isFinite(raw)) {
+              percentText = raw.toFixed(4);
+            } else {
+              return {
+                status: 422,
+                body: {
+                  code: 'PAYMENT_PERCENT_INVALID',
+                  detail: `${field} must be a decimal string or a finite number.`,
+                },
+              };
+            }
+            if (!/^\d+(\.\d{1,4})?$/.test(percentText)) {
+              return {
+                status: 422,
+                body: {
+                  code: 'PAYMENT_PERCENT_INVALID',
+                  detail: `${field} must be a decimal with up to four fractional digits.`,
+                },
+              };
+            }
+            const scaled = scalePercentToBasisPoints(percentText);
+            if (scaled < 0n || scaled > 1000000n) {
+              return {
+                status: 422,
+                body: {
+                  code: 'PAYMENT_PERCENT_OUT_OF_RANGE',
+                  detail: `${field} must be between 0 and 100.`,
+                },
+              };
+            }
+            const shareMinor = divideRounded(grossMinor * scaled, 1000000n, 'half-up');
+            if (target === 'pph') {
+              pphPercentText = percentText;
+              pphAmountMinor = shareMinor;
+            } else {
+              retensiPercentText = percentText;
+              retensiAmountMinor = shareMinor;
+            }
+          }
+          const derivedCashMinor = grossMinor - pphAmountMinor - retensiAmountMinor;
+          if (derivedCashMinor < 0n) {
+            return {
+              status: 422,
+              body: {
+                code: 'PAYMENT_SPLIT_OVER_GROSS',
+                detail: 'PPh plus retensi must not exceed the gross amount.',
+                grossAmount: moneyOutput(grossMinor),
+                derivedCash: moneyOutput(derivedCashMinor),
+              },
+            };
+          }
+          if (derivedCashMinor !== amountMinor) {
+            return {
+              status: 422,
+              body: {
+                code: 'PAYMENT_SPLIT_MISMATCH',
+                detail: 'amount must equal gross minus PPh minus retensi.',
+                amount: moneyOutput(amountMinor),
+                expectedCash: moneyOutput(derivedCashMinor),
+              },
+            };
+          }
+        }
+
+        const inserted = await scoped.db
+          .insert(invoicePayments)
+          .values({
+            studioId: scoped.studioId,
+            invoiceId: invoice.id,
+            amount: moneyOutput(amountMinor),
+            paidAt: new Date(req.date as string),
+            method: typeof req.paymentMethod === 'string' ? req.paymentMethod : 'OTHER',
+            reference: typeof req.reference === 'string' ? req.reference : null,
+            ...(hasSplit
+              ? {
+                  grossAmount: moneyOutput(grossMinor),
+                  pphAmount: moneyOutput(pphAmountMinor),
+                  pphPercent: pphPercentText,
+                  retensiAmount: moneyOutput(retensiAmountMinor),
+                  retensiPercent: retensiPercentText,
+                }
+              : { grossAmount: moneyOutput(grossMinor) }),
+          })
+          .returning({ id: invoicePayments.id });
+        if (!inserted[0]) {
+          throw new Error('The payment insert returned no row.');
+        }
+
+        const loaded = await loadInvoice(scoped, projectId, engagementId, invoice.id);
+        const item = loaded[0];
+        return {
+          status: 201,
+          etag: item?.row.entityVersion ?? null,
+          body: {
+            data: {
+              invoice: item
+                ? projectInvoice(
+                    item.row,
+                    projectCapabilities(user.role).canReadFinance.enabled,
+                    item.payments,
+                    item.components,
+                    item.collectionOwner,
+                  )
+                : null,
+            },
+            meta: { ...meta(c.get('requestId')), idempotentReplay: false },
+          },
+        };
+      },
+      {
+        requestId: c.get('requestId'),
+        method: 'POST',
+        path: c.req.path,
+        flipReplayIdempotent: true,
+        replayStatus: 200,
+      },
+    );
+
+    if (result.outcome === 'conflict') {
+      if (result.code === 'IDEMPOTENCY_KEY_REUSED') {
+        return idempotencyReused(c);
+      }
+      return problem(c, {
+        status: result.status,
+        code: result.code,
+        title: 'Write rejected',
+        detail: 'The payment write was rejected by the server.',
+        requestId: c.get('requestId'),
+      });
+    }
+    return new Response(result.bodyText, {
+      status: result.status,
+      headers: {
+        'content-type': 'application/json',
+        ...(result.etag ? { ETag: etagFor(result.etag) } : {}),
+      },
+    });
   });
+}
+
+/** Maps one `MoneyInputError` to its contract 422 handler problem. */
+function moneyFromError(error: unknown): { code: string; detail: string } {
+  const code = error instanceof MoneyInputError ? error.code : 'MONEY_FORMAT_INVALID';
+  const detail = error instanceof Error ? error.message : 'Money input invalid.';
+  return { code, detail };
+}
+
+function moneyInvalid(detail: string): { code: string; detail: string } {
+  return { code: 'MONEY_FORMAT_INVALID', detail };
+}
+
+/**
+ * Scales a percent decimal with up to four fractional digits to
+ * parts-per-million of the gross (percent x 10^4), exactly:
+ * "2" -> 20000, "2.5" -> 25000, "0.0001" -> 1, "100" -> 1000000.
+ * The caller divides grossMinor * scaled by 10^6, so a share stays an exact
+ * integer minor-unit product until one final half-up rounding. Basis points
+ * (percent x 100) would truncate a four-digit percent such as "0.0001";
+ * this finer scale avoids that loss.
+ */
+function scalePercentToBasisPoints(percentText: string): bigint {
+  const [whole = '0', frac = ''] = percentText.split('.');
+  const digits = `${whole || '0'}${frac || ''}`;
+  return (BigInt(digits) * 10000n) / 10n ** BigInt(frac.length);
 }
