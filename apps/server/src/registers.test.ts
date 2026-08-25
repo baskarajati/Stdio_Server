@@ -1,7 +1,7 @@
 /**
  * Integration tests for the SOL-19 register writes (revision 6).
  *
- * Runs against the live `stdio_dev` database (seed: Studio Contoh). Proves
+ * Runs against its own scratch database (seed: Studio Contoh). Proves
  * the SOL-69 conditions:
  *
  * - Condition 3: every supplied relation resolves inside the studio; a
@@ -17,12 +17,17 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import {
+  createScratchDatabase,
+  dropScratchDatabase,
+  type ScratchDatabase,
+} from '@stdio/db/testing';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createApp } from './app';
 
-const connectionString =
-  process.env.DATABASE_URL ?? 'postgres://stdio:stdio@localhost:5432/stdio_dev';
+/** Admin URL used only to create and drop this suite's scratch database. */
+const adminUrl = process.env.DATABASE_URL ?? 'postgres://stdio:stdio@localhost:5432/stdio_dev';
 
 const SEED_STUDIO = '00000000-0000-4000-8000-000000000001';
 const SEED_OWNER = '00000000-0000-4000-8000-000000000002';
@@ -39,6 +44,7 @@ const SEED_ENGAGEMENT_TWO = '00000000-0000-4000-8000-0000000000ef';
 const OTHER_ENGAGEMENT = '00000000-0000-4000-8000-0000000000a1';
 
 let pool: Pool;
+let scratch: ScratchDatabase;
 let app: ReturnType<typeof createApp>;
 let token = '';
 let designerToken = '';
@@ -101,7 +107,8 @@ function expectProblem(body: ProblemEnvelope, status: number, code: string): voi
 }
 
 beforeAll(async () => {
-  pool = new Pool({ connectionString, max: 5 });
+  scratch = await createScratchDatabase('stdio_registers', adminUrl);
+  pool = new Pool({ connectionString: scratch.url, max: 5 });
   app = createApp(pool);
   token = `naa_reg_${randomUUID()}`;
   designerToken = `naa_reg_designer_${randomUUID()}`;
@@ -215,6 +222,7 @@ afterAll(async () => {
     await client.query(`DELETE FROM invoices WHERE invoice_number LIKE 'REG-%'`);
   });
   await pool.end();
+  await dropScratchDatabase(scratch);
 });
 
 describe('client register writes', () => {

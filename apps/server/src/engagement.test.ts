@@ -1,7 +1,7 @@
 /**
  * Integration tests for the SOL-28 engagement-scoped routes (SOL-94).
  *
- * Runs against the live `stdio_dev` database (seed: Studio Contoh, one
+ * Runs against its own scratch database (seed: Studio Contoh, one
  * project with a DESIGN and a BUILD engagement). Proves the acceptance
  * criteria:
  *
@@ -17,12 +17,17 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import {
+  createScratchDatabase,
+  dropScratchDatabase,
+  type ScratchDatabase,
+} from '@stdio/db/testing';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createApp } from './app';
 
-const connectionString =
-  process.env.DATABASE_URL ?? 'postgres://stdio:stdio@localhost:5432/stdio_dev';
+/** Admin URL used only to create and drop this suite's scratch database. */
+const adminUrl = process.env.DATABASE_URL ?? 'postgres://stdio:stdio@localhost:5432/stdio_dev';
 
 const SEED_STUDIO = '00000000-0000-4000-8000-000000000001';
 const SEED_OWNER = '00000000-0000-4000-8000-000000000002';
@@ -36,6 +41,7 @@ const OTHER_STUDIO = '00000000-0000-4000-8000-0000000000aa';
 const OTHER_USER = '00000000-0000-4000-8000-0000000000bb';
 
 let pool: Pool;
+let scratch: ScratchDatabase;
 let app: ReturnType<typeof createApp>;
 let token: string = '';
 let designerToken = '';
@@ -120,7 +126,8 @@ async function readTransactionPrice(): Promise<string | null> {
 }
 
 beforeAll(async () => {
-  pool = new Pool({ connectionString, max: 5 });
+  scratch = await createScratchDatabase('stdio_engagement', adminUrl);
+  pool = new Pool({ connectionString: scratch.url, max: 5 });
   app = createApp(pool);
   token = `naa_test_${randomUUID()}`;
   await mintToken(SEED_STUDIO, SEED_OWNER, token);
@@ -213,6 +220,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await pool.end();
+  await dropScratchDatabase(scratch);
 });
 
 const auth = () => ({ Authorization: `Bearer ${token}` });

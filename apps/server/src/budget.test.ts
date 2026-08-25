@@ -1,7 +1,7 @@
 /**
  * Integration tests for the SOL-19 budget-versus-actual report.
  *
- * Runs against the live `stdio_dev` database (seed: Studio Contoh). Proves
+ * Runs against its own scratch database (seed: Studio Contoh). Proves
  * the SOL-73-A conditions and the FE conditions:
  *
  * - The residual-allocation counterexample end-to-end: Q=1, R=0.5, U=0.01
@@ -16,12 +16,17 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import {
+  createScratchDatabase,
+  dropScratchDatabase,
+  type ScratchDatabase,
+} from '@stdio/db/testing';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createApp } from './app';
 
-const connectionString =
-  process.env.DATABASE_URL ?? 'postgres://stdio:stdio@localhost:5432/stdio_dev';
+/** Admin URL used only to create and drop this suite's scratch database. */
+const adminUrl = process.env.DATABASE_URL ?? 'postgres://stdio:stdio@localhost:5432/stdio_dev';
 
 const SEED_STUDIO = '00000000-0000-4000-8000-000000000001';
 const SEED_OWNER = '00000000-0000-4000-8000-000000000002';
@@ -29,6 +34,7 @@ const SEED_PROJECT = '00000000-0000-4000-8000-000000000004';
 const SEED_VENDOR = '00000000-0000-4000-8000-000000000005';
 
 let pool: Pool;
+let scratch: ScratchDatabase;
 let app: ReturnType<typeof createApp>;
 let token = '';
 let designerToken = '';
@@ -203,7 +209,8 @@ async function cleanupFixtures(): Promise<void> {
 }
 
 beforeAll(async () => {
-  pool = new Pool({ connectionString, max: 5 });
+  scratch = await createScratchDatabase('stdio_budget', adminUrl);
+  pool = new Pool({ connectionString: scratch.url, max: 5 });
   app = createApp(pool);
   token = `naa_bgt_${randomUUID()}`;
   designerToken = `naa_bgt_designer_${randomUUID()}`;
@@ -236,6 +243,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await cleanupFixtures();
   await pool.end();
+  await dropScratchDatabase(scratch);
 });
 
 describe('budget-versus-actual report', () => {

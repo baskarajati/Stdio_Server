@@ -1,7 +1,7 @@
 /**
  * Integration test for the token → `/me` path.
  *
- * Runs against the live `stdio_dev` database, which the seed has populated
+ * Runs against its own scratch database, which the seed has populated
  * (`Studio Contoh`, owner, one project with two engagements). The test
  * mints an access token, then asserts the `/me` response projects the
  * correct user, company, and capability set.
@@ -11,17 +11,23 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import {
+  createScratchDatabase,
+  dropScratchDatabase,
+  type ScratchDatabase,
+} from '@stdio/db/testing';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createApp } from './app';
 
-const connectionString =
-  process.env.DATABASE_URL ?? 'postgres://stdio:stdio@localhost:5432/stdio_dev';
+/** Admin URL used only to create and drop this suite's scratch database. */
+const adminUrl = process.env.DATABASE_URL ?? 'postgres://stdio:stdio@localhost:5432/stdio_dev';
 
 const SEED_STUDIO = '00000000-0000-4000-8000-000000000001';
 const SEED_OWNER = '00000000-0000-4000-8000-000000000002';
 
 let pool: Pool;
+let scratch: ScratchDatabase;
 let app: ReturnType<typeof createApp>;
 
 type Capability = { enabled: boolean; reason: string };
@@ -42,12 +48,14 @@ type MeBody = {
 };
 
 beforeAll(async () => {
-  pool = new Pool({ connectionString, max: 5 });
+  scratch = await createScratchDatabase('stdio_me', adminUrl);
+  pool = new Pool({ connectionString: scratch.url, max: 5 });
   app = createApp(pool);
 });
 
 afterAll(async () => {
   await pool.end();
+  await dropScratchDatabase(scratch);
 });
 
 async function mintToken(token: string): Promise<void> {
