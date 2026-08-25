@@ -846,6 +846,7 @@ describe('engagement-scoped invoices', () => {
   });
 
   it('records a plain payment on the OWNER capability (SOL-132)', async () => {
+    const reference = `plain-${randomUUID()}`;
     const res = await app.request(
       `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${SEED_INVOICE}/payment`,
       {
@@ -859,6 +860,7 @@ describe('engagement-scoped invoices', () => {
           amount: '100000.00',
           date: '2026-08-22',
           paymentMethod: 'BANK_TRANSFER',
+          reference,
         }),
       },
     );
@@ -870,7 +872,8 @@ describe('engagement-scoped invoices', () => {
     const stored = await tenantQuery(SEED_STUDIO, async (client) => {
       const rows = (await client.query(
         `SELECT amount, gross_amount, pph_amount, retensi_amount
-         FROM invoice_payments ORDER BY created_at DESC LIMIT 1`,
+         FROM invoice_payments WHERE invoice_id = $1 AND reference = $2`,
+        [SEED_INVOICE, reference],
       )) as { rows: Record<string, string | null>[] };
       return rows.rows[0] ?? {};
     });
@@ -882,6 +885,7 @@ describe('engagement-scoped invoices', () => {
 
   it('records a split payment and derives cash = gross - pph - retensi (SOL-132)', async () => {
     // A 10000.00 gross termin with 2% PPh withholding and 5% retensi held.
+    const reference = `split-${randomUUID()}`;
     const res = await app.request(
       `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${SEED_INVOICE}/payment`,
       {
@@ -895,7 +899,7 @@ describe('engagement-scoped invoices', () => {
           amount: '9300.00',
           date: '2026-08-23',
           paymentMethod: 'BANK_TRANSFER',
-          reference: 'BCA-8812',
+          reference,
           grossAmount: '10000.00',
           pphPercent: '2.0000',
           retensiPercent: '5.0000',
@@ -909,7 +913,8 @@ describe('engagement-scoped invoices', () => {
     const stored = await tenantQuery(SEED_STUDIO, async (client) => {
       const rows = (await client.query(
         `SELECT amount, gross_amount, pph_percent, pph_amount, retensi_percent, retensi_amount
-         FROM invoice_payments WHERE reference = 'BCA-8812'`,
+         FROM invoice_payments WHERE invoice_id = $1 AND reference = $2`,
+        [SEED_INVOICE, reference],
       )) as { rows: Record<string, string | null>[] };
       return rows.rows[0] ?? {};
     });

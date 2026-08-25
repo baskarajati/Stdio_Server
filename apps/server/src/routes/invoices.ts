@@ -521,7 +521,7 @@ export function registerInvoiceRoutes(app: Hono<ServerEnv>, pool: Pool): void {
           };
         }
         const invoices_ = await scoped.db
-          .select({ id: invoices.id, currency: invoices.currency })
+          .select({ id: invoices.id })
           .from(invoices)
           .where(and(eq(invoices.id, invoiceId), eq(invoices.engagementId, engagementId)))
           .for('update')
