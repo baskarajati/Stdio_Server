@@ -21,18 +21,18 @@
  * `InvoiceDetail`), so the register reads can reuse the same projections.
  */
 
-import { MoneyInputError, moneyOutput, parseStrictMoneyInput } from '@stdio/core';
+import { MoneyInputError, moneyFromDecimal, moneyOutput, parseStrictMoneyInput } from '@stdio/core';
 import { schema } from '@stdio/db';
-import { and, count, eq } from 'drizzle-orm';
+import { and, count, desc, eq, ilike, inArray, or, type SQL, sql } from 'drizzle-orm';
 import type { Hono } from 'hono';
 import type { Pool } from 'pg';
 
 import type { ServerEnv } from '../app';
 import { type Capability, projectCapabilities } from '../capabilities';
-import type { Db } from '../context/db';
+import { type Db, withStudioTx } from '../context/db';
 import { fingerprintFor, guardedWrite, parseIfMatch, requireIdempotencyKey } from '../guards';
-import { etagFor, meta, problem } from '../http';
-import { moneyNumber } from '../money';
+import { etagFor, meta, problem, requestBuildOf } from '../http';
+import { jsonResponse, moneyNumber } from '../money';
 import { dateLabel, moneyLabel, sortKey, statusLabel } from '../projections';
 
 const {
@@ -42,6 +42,7 @@ const {
   quotations,
   quotationItems,
   invoices,
+  purchaseOrders,
   invoicePayments,
   invoiceReceivableComponents,
   users,
@@ -273,6 +274,19 @@ function projectVendor(
   };
 }
 
+/**
+ * The contract `VendorDetail` = `VendorSummary` plus the `contacts` array.
+ * The register surface has no vendor-contact rows yet, so the detail emits
+ * the empty array the schema requires.
+ */
+function projectVendorDetail(
+  row: VendorRow,
+  purchaseOrderCount: number,
+  role: Parameters<typeof projectCapabilities>[0],
+): Record<string, unknown> {
+  return { ...projectVendor(row, purchaseOrderCount, role), contacts: [] };
+}
+
 // ---------------------------------------------------------------------------
 // Spec items
 // ---------------------------------------------------------------------------
@@ -346,6 +360,19 @@ function projectSpecItem(
     updatedAt: row.updatedAt.toISOString(),
     vendorName: null,
   };
+}
+
+/**
+ * The contract `SpecItemDetail` = `SpecItemSummary` plus the `alternates`
+ * array. The register surface has no spec-alternate rows yet, so the detail
+ * emits the empty array the schema requires.
+ */
+function projectSpecItemDetail(
+  row: SpecItemRow,
+  canReadFinance: boolean,
+  role: Parameters<typeof projectCapabilities>[0],
+): Record<string, unknown> {
+  return { ...projectSpecItem(row, canReadFinance, role), alternates: [] };
 }
 
 // ---------------------------------------------------------------------------
@@ -523,6 +550,14 @@ function parseDraftComponents(
   return { ok: true, components };
 }
 
+type RegisterPaymentRow = {
+  id: string;
+  amount: string;
+  paidAt: Date;
+  method: string;
+  reference: string | null;
+};
+
 async function loadInvoiceRegister(
   scoped: Db,
   id: string,
@@ -530,6 +565,7 @@ async function loadInvoiceRegister(
   row: InvoiceRegisterRow;
   paymentCount: number;
   components: { kind: string; amount: string; settledAmount: string }[];
+  payments: RegisterPaymentRow[];
   paidAmount: string | null;
 } | null> {
   const rows = await scoped.db
@@ -574,10 +610,22 @@ async function loadInvoiceRegister(
       .where(eq(invoiceReceivableComponents.invoiceId, id))
       .orderBy(invoiceReceivableComponents.kind),
   ]);
+  const paymentList = await scoped.db
+    .select({
+      id: invoicePayments.id,
+      amount: invoicePayments.amount,
+      paidAt: invoicePayments.paidAt,
+      method: invoicePayments.method,
+      reference: invoicePayments.reference,
+    })
+    .from(invoicePayments)
+    .where(eq(invoicePayments.invoiceId, id))
+    .orderBy(desc(invoicePayments.paidAt));
   return {
     row,
     paymentCount: Number(paymentRows[0]?.value ?? 0),
     components: componentRows,
+    payments: paymentList,
     paidAmount: null,
   };
 }
@@ -588,9 +636,26 @@ function projectInvoiceRegister(
   canReadFinance: boolean,
   role: Parameters<typeof projectCapabilities>[0],
   components: { kind: string; amount: string; settledAmount: string }[] = [],
+  payments: RegisterPaymentRow[] = [],
 ): Record<string, unknown> {
   const currency = row.currency ?? 'IDR';
   const status = row.status;
+  // SOL-163: the label fields are contract-required strings. The paid and
+  // outstanding labels derive from the stored payment rows exactly (minor
+  // units), never a float; a null total renders the empty label, matching the
+  // lens-off form rather than a null that violates the schema.
+  const paidMinor = payments.reduce(
+    (acc, payment) => acc + moneyFromDecimal(payment.amount, currency).amount,
+    0n,
+  );
+  const totalMinor = row.totalAmount ? moneyFromDecimal(row.totalAmount, currency).amount : 0n;
+  const outstandingMinor = totalMinor - paidMinor;
+  const label = (value: string | null): string => {
+    if (!canReadFinance) {
+      return '';
+    }
+    return moneyLabel(value, currency) ?? '';
+  };
   return {
     capabilities: { read: readCapability(role) },
     client: { id: row.clientId, name: row.clientName ?? 'Unknown client' },
@@ -610,23 +675,50 @@ function projectInvoiceRegister(
     isOverdue: false,
     issueDateLabel: row.issueDate ? dateLabel(row.issueDate) : null,
     issuedAt: row.issuedAt ? row.issuedAt.toISOString() : null,
-    outstandingAmountLabel: canReadFinance ? moneyLabel(row.totalAmount, currency) : '',
-    paidAmountLabel: canReadFinance ? moneyLabel(null, currency) : '',
+    outstandingAmountLabel: label(moneyOutput(outstandingMinor < 0n ? 0n : outstandingMinor)),
+    paidAmountLabel: label(moneyOutput(paidMinor)),
+    payments: payments.map((payment) => ({
+      id: payment.id,
+      amountLabel: label(payment.amount),
+      dateLabel: dateLabel(payment.paidAt) ?? '',
+      methodLabel: payment.method,
+      reference: payment.reference,
+    })),
     receivableComponents: components.map((component) => ({
       kind: component.kind,
-      amountLabel: canReadFinance ? moneyLabel(component.amount, currency) : '',
-      settledAmountLabel: canReadFinance ? moneyLabel(component.settledAmount, currency) : '',
-      outstandingAmountLabel: canReadFinance
-        ? moneyLabel(subtractDecimal(component.amount, component.settledAmount), currency)
-        : '',
+      amountLabel: label(component.amount),
+      settledAmountLabel: label(component.settledAmount),
+      outstandingAmountLabel: label(subtractDecimal(component.amount, component.settledAmount)),
     })),
     projectName: row.projectName,
     source: { href: `/invoices/${row.id}`, type: 'invoice' },
     status,
     statusLabel: statusLabel(status) ?? status,
-    totalAmountLabel: canReadFinance ? moneyLabel(row.totalAmount, currency) : '',
+    totalAmountLabel: label(row.totalAmount),
     updatedAt: row.updatedAt.toISOString(),
   };
+}
+
+/**
+ * The contract `InvoiceSummary` (the register list row) forbids the `dueDate`
+ * and `payments` keys that `InvoiceDetail` requires. The summary is the
+ * detail projection with those two keys dropped; every other field is
+ * identical.
+ */
+function projectInvoiceSummary(
+  row: InvoiceRegisterRow,
+  paymentCount: number,
+  canReadFinance: boolean,
+  role: Parameters<typeof projectCapabilities>[0],
+  components: { kind: string; amount: string; settledAmount: string }[] = [],
+  payments: RegisterPaymentRow[] = [],
+): Record<string, unknown> {
+  const {
+    dueDate: _dueDate,
+    payments: _payments,
+    ...summary
+  } = projectInvoiceRegister(row, paymentCount, canReadFinance, role, components, payments);
+  return summary;
 }
 
 // ---------------------------------------------------------------------------
@@ -697,7 +789,728 @@ async function guardedRegisterWrite(
 
 const mutationMeta = (requestId: string) => ({ ...meta(requestId), idempotentReplay: false });
 
+// ---------------------------------------------------------------------------
+// Register reads (SOL-163): the GET list + GET detail for the five registers.
+// The list responses reuse the write projections (`ClientSummary` etc.), the
+// detail responses reuse them too plus the detail-only keys the contract
+// requires (`contacts`, `alternates`, `payments`). Every query runs on the
+// tenant path inside `withStudioTx`, so the RLS boundary applies unchanged.
+// ---------------------------------------------------------------------------
+
+/** Parses the contract `page`/`pageSize` query pair with the same clamps as
+ * the project register (page >= 1, pageSize 1..100, default 10). */
+function registerPage(
+  pageRaw: string | null | undefined,
+  pageSizeRaw: string | null | undefined,
+): { page: number; pageSize: number } {
+  const int = (value: string | null | undefined, fallback: number): number => {
+    const parsed = Number.parseInt(value ?? '', 10);
+    return Number.isNaN(parsed) ? fallback : parsed;
+  };
+  return {
+    page: Math.max(1, int(pageRaw, 1)),
+    pageSize: Math.min(100, Math.max(1, int(pageSizeRaw, 10))),
+  };
+}
+
+const totalPagesOf = (totalItems: number, pageSize: number): number =>
+  Math.max(1, Math.ceil(totalItems / pageSize));
+
+type ClientCounts = { invoices: number; projects: number; quotations: number };
+
+async function loadClientList(
+  scoped: Db,
+  search: string | null,
+  page: number,
+  pageSize: number,
+): Promise<{ rows: ClientRow[]; totalItems: number }> {
+  const filter: SQL | undefined = search
+    ? or(
+        ilike(clients.name, `%${search}%`),
+        ilike(clients.clientNumber, `%${search}%`),
+        ilike(clients.companyName, `%${search}%`),
+      )
+    : undefined;
+  const where = filter ?? sql`true`;
+  const totalRows = await scoped.db.select({ value: count() }).from(clients).where(where);
+  const totalItems = Number(totalRows[0]?.value ?? 0);
+  const rows = await scoped.db
+    .select({
+      id: clients.id,
+      clientNumber: clients.clientNumber,
+      name: clients.name,
+      clientType: clients.clientType,
+      companyName: clients.companyName,
+      location: clients.location,
+      leadSource: clients.leadSource,
+      status: clients.status,
+      accountManagerId: clients.accountManagerId,
+      primaryContactName: clients.primaryContactName,
+      primaryContactEmail: clients.primaryContactEmail,
+      primaryContactPhone: clients.primaryContactPhone,
+      lastContactedAt: clients.lastContactedAt,
+      entityVersion: clients.entityVersion,
+      updatedAt: clients.updatedAt,
+      managerName: users.name,
+    })
+    .from(clients)
+    .leftJoin(users, and(eq(users.id, clients.accountManagerId)))
+    .where(where)
+    .orderBy(desc(clients.updatedAt), desc(clients.id))
+    .limit(pageSize)
+    .offset((page - 1) * pageSize);
+  return { rows, totalItems };
+}
+
+async function clientRegisterCounts(scoped: Db, ids: string[]): Promise<Map<string, ClientCounts>> {
+  const counts = new Map<string, ClientCounts>();
+  if (ids.length === 0) {
+    return counts;
+  }
+  const [invoiceRows, projectRows, quotationRows] = await Promise.all([
+    scoped.db
+      .select({ id: invoices.clientId, value: count() })
+      .from(invoices)
+      .where(inArray(invoices.clientId, ids))
+      .groupBy(invoices.clientId),
+    scoped.db
+      .select({ id: projects.clientId, value: count() })
+      .from(projects)
+      .where(inArray(projects.clientId, ids))
+      .groupBy(projects.clientId),
+    scoped.db
+      .select({ id: quotations.clientId, value: count() })
+      .from(quotations)
+      .where(inArray(quotations.clientId, ids))
+      .groupBy(quotations.clientId),
+  ]);
+  for (const row of invoiceRows) {
+    const entry = counts.get(row.id) ?? { invoices: 0, projects: 0, quotations: 0 };
+    entry.invoices = Number(row.value ?? 0);
+    counts.set(row.id, entry);
+  }
+  for (const row of projectRows) {
+    const entry = counts.get(row.id) ?? { invoices: 0, projects: 0, quotations: 0 };
+    entry.projects = Number(row.value ?? 0);
+    counts.set(row.id, entry);
+  }
+  for (const row of quotationRows) {
+    const entry = counts.get(row.id) ?? { invoices: 0, projects: 0, quotations: 0 };
+    entry.quotations = Number(row.value ?? 0);
+    counts.set(row.id, entry);
+  }
+  return counts;
+}
+
+async function loadVendorList(
+  scoped: Db,
+  search: string | null,
+  page: number,
+  pageSize: number,
+): Promise<{ rows: VendorRow[]; totalItems: number }> {
+  const filter: SQL | undefined = search
+    ? or(ilike(vendors.name, `%${search}%`), ilike(vendors.vendorCode, `%${search}%`))
+    : undefined;
+  const where = filter ?? sql`true`;
+  const totalRows = await scoped.db.select({ value: count() }).from(vendors).where(where);
+  const totalItems = Number(totalRows[0]?.value ?? 0);
+  const rows = await scoped.db
+    .select({
+      id: vendors.id,
+      vendorCode: vendors.vendorCode,
+      name: vendors.name,
+      email: vendors.email,
+      phone: vendors.phone,
+      website: vendors.website,
+      category: vendors.category,
+      paymentTerms: vendors.paymentTerms,
+      preferred: vendors.preferred,
+      blocked: vendors.blocked,
+      blockedReason: vendors.blockedReason,
+      status: vendors.status,
+      entityVersion: vendors.entityVersion,
+      updatedAt: vendors.updatedAt,
+    })
+    .from(vendors)
+    .where(where)
+    .orderBy(desc(vendors.updatedAt), desc(vendors.id))
+    .limit(pageSize)
+    .offset((page - 1) * pageSize);
+  return { rows, totalItems };
+}
+
+async function vendorRegisterCounts(scoped: Db, ids: string[]): Promise<Map<string, number>> {
+  const counts = new Map<string, number>();
+  if (ids.length === 0) {
+    return counts;
+  }
+  const rows = await scoped.db
+    .select({ id: purchaseOrders.vendorId, value: count() })
+    .from(purchaseOrders)
+    .where(inArray(purchaseOrders.vendorId, ids))
+    .groupBy(purchaseOrders.vendorId);
+  for (const row of rows) {
+    counts.set(row.id, Number(row.value ?? 0));
+  }
+  return counts;
+}
+
+async function loadSpecItemList(
+  scoped: Db,
+  search: string | null,
+  page: number,
+  pageSize: number,
+): Promise<{ rows: SpecItemRow[]; totalItems: number }> {
+  const filter: SQL | undefined = search
+    ? or(ilike(specItems.name, `%${search}%`), ilike(specItems.brand, `%${search}%`))
+    : undefined;
+  const where = filter ?? sql`true`;
+  const totalRows = await scoped.db.select({ value: count() }).from(specItems).where(where);
+  const totalItems = Number(totalRows[0]?.value ?? 0);
+  const rows = await scoped.db
+    .select({
+      id: specItems.id,
+      projectId: specItems.projectId,
+      name: specItems.name,
+      room: specItems.room,
+      quantityLabel: specItems.quantityLabel,
+      brand: specItems.brand,
+      category: specItems.category,
+      entityVersion: specItems.entityVersion,
+      updatedAt: specItems.updatedAt,
+      projectName: projects.name,
+    })
+    .from(specItems)
+    .leftJoin(projects, and(eq(projects.id, specItems.projectId)))
+    .where(where)
+    .orderBy(desc(specItems.updatedAt), desc(specItems.id))
+    .limit(pageSize)
+    .offset((page - 1) * pageSize);
+  return { rows, totalItems };
+}
+
+async function loadQuotationList(
+  scoped: Db,
+  search: string | null,
+  page: number,
+  pageSize: number,
+): Promise<{ rows: QuotationRegisterRow[]; totalItems: number }> {
+  const filter: SQL | undefined = search
+    ? or(ilike(quotations.title, `%${search}%`), ilike(quotations.quotationNumber, `%${search}%`))
+    : undefined;
+  const where = filter ?? sql`true`;
+  const totalRows = await scoped.db.select({ value: count() }).from(quotations).where(where);
+  const totalItems = Number(totalRows[0]?.value ?? 0);
+  const rows = await scoped.db
+    .select({
+      id: quotations.id,
+      quotationNumber: quotations.quotationNumber,
+      title: quotations.title,
+      clientId: quotations.clientId,
+      projectId: quotations.projectId,
+      engagementId: quotations.engagementId,
+      version: quotations.version,
+      status: quotations.status,
+      quotationType: quotations.quotationType,
+      currency: quotations.currency,
+      totalAmount: quotations.totalAmount,
+      validUntil: quotations.validUntil,
+      quotationDate: quotations.quotationDate,
+      entityVersion: quotations.entityVersion,
+      updatedAt: quotations.updatedAt,
+      createdAt: quotations.createdAt,
+      clientName: clients.name,
+      projectName: projects.name,
+    })
+    .from(quotations)
+    .leftJoin(clients, and(eq(clients.id, quotations.clientId)))
+    .leftJoin(projects, and(eq(projects.id, quotations.projectId)))
+    .where(where)
+    .orderBy(desc(quotations.updatedAt), desc(quotations.createdAt), desc(quotations.id))
+    .limit(pageSize)
+    .offset((page - 1) * pageSize);
+  return { rows, totalItems };
+}
+
+async function quotationRegisterCounts(scoped: Db, ids: string[]): Promise<Map<string, number>> {
+  const counts = new Map<string, number>();
+  if (ids.length === 0) {
+    return counts;
+  }
+  const rows = await scoped.db
+    .select({ id: quotationItems.quotationId, value: count() })
+    .from(quotationItems)
+    .where(inArray(quotationItems.quotationId, ids))
+    .groupBy(quotationItems.quotationId);
+  for (const row of rows) {
+    counts.set(row.id, Number(row.value ?? 0));
+  }
+  return counts;
+}
+
+type InvoiceListExtras = {
+  paymentCount: number;
+  components: { kind: string; amount: string; settledAmount: string }[];
+  payments: RegisterPaymentRow[];
+};
+
+async function loadInvoiceList(
+  scoped: Db,
+  search: string | null,
+  page: number,
+  pageSize: number,
+): Promise<{
+  rows: InvoiceRegisterRow[];
+  totalItems: number;
+  extras: Map<string, InvoiceListExtras>;
+}> {
+  const filter: SQL | undefined = search
+    ? or(ilike(invoices.invoiceNumber, `%${search}%`), ilike(invoices.displayNumber, `%${search}%`))
+    : undefined;
+  const where = filter ?? sql`true`;
+  const totalRows = await scoped.db.select({ value: count() }).from(invoices).where(where);
+  const totalItems = Number(totalRows[0]?.value ?? 0);
+  const rows = await scoped.db
+    .select({
+      id: invoices.id,
+      invoiceNumber: invoices.invoiceNumber,
+      displayNumber: invoices.displayNumber,
+      clientId: invoices.clientId,
+      projectId: invoices.projectId,
+      status: invoices.status,
+      currency: invoices.currency,
+      totalAmount: invoices.totalAmount,
+      issueDate: invoices.issueDate,
+      dueDate: invoices.dueDate,
+      issuedAt: invoices.issuedAt,
+      entityVersion: invoices.entityVersion,
+      updatedAt: invoices.updatedAt,
+      clientName: clients.name,
+      projectName: projects.name,
+    })
+    .from(invoices)
+    .leftJoin(clients, and(eq(clients.id, invoices.clientId)))
+    .leftJoin(projects, and(eq(projects.id, invoices.projectId)))
+    .where(where)
+    .orderBy(desc(invoices.updatedAt), desc(invoices.id))
+    .limit(pageSize)
+    .offset((page - 1) * pageSize);
+  const ids = rows.map((r) => r.id);
+  const extras = new Map<string, InvoiceListExtras>();
+  if (ids.length > 0) {
+    const [paymentCountRows, paymentRows, componentRows] = await Promise.all([
+      scoped.db
+        .select({ id: invoicePayments.invoiceId, value: count() })
+        .from(invoicePayments)
+        .where(inArray(invoicePayments.invoiceId, ids))
+        .groupBy(invoicePayments.invoiceId),
+      scoped.db
+        .select({
+          id: invoicePayments.id,
+          invoiceId: invoicePayments.invoiceId,
+          amount: invoicePayments.amount,
+          paidAt: invoicePayments.paidAt,
+          method: invoicePayments.method,
+          reference: invoicePayments.reference,
+        })
+        .from(invoicePayments)
+        .where(inArray(invoicePayments.invoiceId, ids))
+        .orderBy(desc(invoicePayments.paidAt)),
+      scoped.db
+        .select({
+          invoiceId: invoiceReceivableComponents.invoiceId,
+          kind: invoiceReceivableComponents.kind,
+          amount: invoiceReceivableComponents.amount,
+          settledAmount: invoiceReceivableComponents.settledAmount,
+        })
+        .from(invoiceReceivableComponents)
+        .where(inArray(invoiceReceivableComponents.invoiceId, ids))
+        .orderBy(invoiceReceivableComponents.kind),
+    ]);
+    for (const id of ids) {
+      extras.set(id, { paymentCount: 0, components: [], payments: [] });
+    }
+    for (const row of paymentCountRows) {
+      const entry = extras.get(row.id);
+      if (entry) {
+        entry.paymentCount = Number(row.value ?? 0);
+      }
+    }
+    for (const row of paymentRows) {
+      const entry = extras.get(row.invoiceId);
+      if (entry) {
+        entry.payments.push(row);
+      }
+    }
+    for (const row of componentRows) {
+      const entry = extras.get(row.invoiceId);
+      if (entry) {
+        entry.components.push(row);
+      }
+    }
+  }
+  return { rows, totalItems, extras };
+}
+
+function registerReadNotFound(
+  c: Parameters<typeof problem>[0],
+  code: string,
+  title: string,
+  detail: string,
+): Response {
+  return problem(c, {
+    status: 404,
+    code,
+    title,
+    detail,
+    requestId: c.get('requestId'),
+  });
+}
+
 export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
+  // --- Register reads (SOL-163) -------------------------------------------
+  // GET /clients — the client register (optional `q`, `page`, `pageSize`).
+  app.get('/clients', async (c) => {
+    const user = c.get('user');
+    const { page, pageSize } = registerPage(c.req.query('page'), c.req.query('pageSize'));
+    const search = c.req.query('q')?.trim() || null;
+    const build = requestBuildOf(c);
+
+    const result = await withStudioTx(pool, user, async (scoped) => {
+      const { rows, totalItems } = await loadClientList(scoped, search, page, pageSize);
+      const counts = await clientRegisterCounts(
+        scoped,
+        rows.map((r) => r.id),
+      );
+      return {
+        status: 200 as const,
+        data: {
+          clients: rows.map((row) =>
+            projectClient(
+              row,
+              counts.get(row.id) ?? { invoices: 0, projects: 0, quotations: 0 },
+              user.role,
+            ),
+          ),
+        },
+        pagination: { page, pageSize, totalItems, totalPages: totalPagesOf(totalItems, pageSize) },
+      };
+    });
+
+    return jsonResponse({
+      data: result.data,
+      meta: meta(c.get('requestId'), { requestBuild: build, pagination: result.pagination }),
+    });
+  });
+
+  // GET /clients/{id} — detail with the weak ETag.
+  app.get('/clients/:id', async (c) => {
+    const user = c.get('user');
+    const id = c.req.param('id');
+    const build = requestBuildOf(c);
+
+    const result = await withStudioTx(pool, user, async (scoped) => {
+      const loaded = await loadClient(scoped, id);
+      if (!loaded) {
+        return { status: 404 as const };
+      }
+      return {
+        status: 200 as const,
+        client: projectClient(loaded.row, loaded.counts, user.role),
+        entityVersion: loaded.row.entityVersion,
+      };
+    });
+
+    if (result.status === 404) {
+      return registerReadNotFound(
+        c,
+        'CLIENT_NOT_FOUND',
+        'Client not found',
+        'The client does not exist in this studio.',
+      );
+    }
+    return jsonResponse(
+      { data: { client: result.client }, meta: meta(c.get('requestId'), { requestBuild: build }) },
+      { headers: { ETag: etagFor(result.entityVersion) } },
+    );
+  });
+
+  // GET /vendors — the vendor register.
+  app.get('/vendors', async (c) => {
+    const user = c.get('user');
+    const { page, pageSize } = registerPage(c.req.query('page'), c.req.query('pageSize'));
+    const search = c.req.query('q')?.trim() || null;
+    const build = requestBuildOf(c);
+
+    const result = await withStudioTx(pool, user, async (scoped) => {
+      const { rows, totalItems } = await loadVendorList(scoped, search, page, pageSize);
+      const counts = await vendorRegisterCounts(
+        scoped,
+        rows.map((r) => r.id),
+      );
+      return {
+        status: 200 as const,
+        data: {
+          vendors: rows.map((row) => projectVendor(row, counts.get(row.id) ?? 0, user.role)),
+        },
+        pagination: { page, pageSize, totalItems, totalPages: totalPagesOf(totalItems, pageSize) },
+      };
+    });
+
+    return jsonResponse({
+      data: result.data,
+      meta: meta(c.get('requestId'), { requestBuild: build, pagination: result.pagination }),
+    });
+  });
+
+  // GET /vendors/{id} — detail with the weak ETag.
+  app.get('/vendors/:id', async (c) => {
+    const user = c.get('user');
+    const id = c.req.param('id');
+    const build = requestBuildOf(c);
+
+    const result = await withStudioTx(pool, user, async (scoped) => {
+      const row = await loadVendor(scoped, id);
+      if (!row) {
+        return { status: 404 as const };
+      }
+      const poCountRows = await scoped.db
+        .select({ value: count() })
+        .from(purchaseOrders)
+        .where(eq(purchaseOrders.vendorId, id));
+      return {
+        status: 200 as const,
+        vendor: projectVendorDetail(row, Number(poCountRows[0]?.value ?? 0), user.role),
+        entityVersion: row.entityVersion,
+      };
+    });
+
+    if (result.status === 404) {
+      return registerReadNotFound(
+        c,
+        'VENDOR_NOT_FOUND',
+        'Vendor not found',
+        'The vendor does not exist in this studio.',
+      );
+    }
+    return jsonResponse(
+      { data: { vendor: result.vendor }, meta: meta(c.get('requestId'), { requestBuild: build }) },
+      { headers: { ETag: etagFor(result.entityVersion) } },
+    );
+  });
+
+  // GET /spec-items — the spec-item register.
+  app.get('/spec-items', async (c) => {
+    const user = c.get('user');
+    const { page, pageSize } = registerPage(c.req.query('page'), c.req.query('pageSize'));
+    const search = c.req.query('q')?.trim() || null;
+    const build = requestBuildOf(c);
+    const canReadFinance = projectCapabilities(user.role).canReadFinance.enabled;
+
+    const result = await withStudioTx(pool, user, async (scoped) => {
+      const { rows, totalItems } = await loadSpecItemList(scoped, search, page, pageSize);
+      return {
+        status: 200 as const,
+        data: {
+          specItems: rows.map((row) => projectSpecItem(row, canReadFinance, user.role)),
+        },
+        pagination: { page, pageSize, totalItems, totalPages: totalPagesOf(totalItems, pageSize) },
+      };
+    });
+
+    return jsonResponse({
+      data: result.data,
+      meta: meta(c.get('requestId'), { requestBuild: build, pagination: result.pagination }),
+    });
+  });
+
+  // GET /spec-items/{id} — detail with the weak ETag.
+  app.get('/spec-items/:id', async (c) => {
+    const user = c.get('user');
+    const id = c.req.param('id');
+    const build = requestBuildOf(c);
+
+    const result = await withStudioTx(pool, user, async (scoped) => {
+      const row = await loadSpecItem(scoped, id);
+      if (!row) {
+        return { status: 404 as const };
+      }
+      return {
+        status: 200 as const,
+        specItem: projectSpecItemDetail(
+          row,
+          projectCapabilities(user.role).canReadFinance.enabled,
+          user.role,
+        ),
+        entityVersion: row.entityVersion,
+      };
+    });
+
+    if (result.status === 404) {
+      return registerReadNotFound(
+        c,
+        'SPEC_ITEM_NOT_FOUND',
+        'Spec item not found',
+        'The spec item does not exist in this studio.',
+      );
+    }
+    return jsonResponse(
+      {
+        data: { specItem: result.specItem },
+        meta: meta(c.get('requestId'), { requestBuild: build }),
+      },
+      { headers: { ETag: etagFor(result.entityVersion) } },
+    );
+  });
+
+  // GET /quotations — the quotation register.
+  app.get('/quotations', async (c) => {
+    const user = c.get('user');
+    const { page, pageSize } = registerPage(c.req.query('page'), c.req.query('pageSize'));
+    const search = c.req.query('q')?.trim() || null;
+    const build = requestBuildOf(c);
+    const canReadFinance = projectCapabilities(user.role).canReadFinance.enabled;
+
+    const result = await withStudioTx(pool, user, async (scoped) => {
+      const { rows, totalItems } = await loadQuotationList(scoped, search, page, pageSize);
+      const counts = await quotationRegisterCounts(
+        scoped,
+        rows.map((r) => r.id),
+      );
+      return {
+        status: 200 as const,
+        data: {
+          quotations: rows.map((row) =>
+            projectQuotationRegister(row, counts.get(row.id) ?? 0, canReadFinance, user.role),
+          ),
+        },
+        pagination: { page, pageSize, totalItems, totalPages: totalPagesOf(totalItems, pageSize) },
+      };
+    });
+
+    return jsonResponse({
+      data: result.data,
+      meta: meta(c.get('requestId'), { requestBuild: build, pagination: result.pagination }),
+    });
+  });
+
+  // GET /quotations/{id} — detail with the weak ETag.
+  app.get('/quotations/:id', async (c) => {
+    const user = c.get('user');
+    const id = c.req.param('id');
+    const build = requestBuildOf(c);
+
+    const result = await withStudioTx(pool, user, async (scoped) => {
+      const loaded = await loadQuotationRegister(scoped, id);
+      if (!loaded) {
+        return { status: 404 as const };
+      }
+      return {
+        status: 200 as const,
+        quotation: projectQuotationRegister(
+          loaded.row,
+          loaded.itemCount,
+          projectCapabilities(user.role).canReadFinance.enabled,
+          user.role,
+        ),
+        entityVersion: loaded.row.entityVersion,
+      };
+    });
+
+    if (result.status === 404) {
+      return registerReadNotFound(
+        c,
+        'QUOTATION_NOT_FOUND',
+        'Quotation not found',
+        'The quotation does not exist in this studio.',
+      );
+    }
+    return jsonResponse(
+      {
+        data: { quotation: result.quotation },
+        meta: meta(c.get('requestId'), { requestBuild: build }),
+      },
+      { headers: { ETag: etagFor(result.entityVersion) } },
+    );
+  });
+
+  // GET /invoices — the invoice register.
+  app.get('/invoices', async (c) => {
+    const user = c.get('user');
+    const { page, pageSize } = registerPage(c.req.query('page'), c.req.query('pageSize'));
+    const search = c.req.query('q')?.trim() || null;
+    const build = requestBuildOf(c);
+    const canReadFinance = projectCapabilities(user.role).canReadFinance.enabled;
+
+    const result = await withStudioTx(pool, user, async (scoped) => {
+      const { rows, totalItems, extras } = await loadInvoiceList(scoped, search, page, pageSize);
+      return {
+        status: 200 as const,
+        data: {
+          invoices: rows.map((row) => {
+            const extra = extras.get(row.id) ?? { paymentCount: 0, components: [], payments: [] };
+            return projectInvoiceSummary(
+              row,
+              extra.paymentCount,
+              canReadFinance,
+              user.role,
+              extra.components,
+              extra.payments,
+            );
+          }),
+        },
+        pagination: { page, pageSize, totalItems, totalPages: totalPagesOf(totalItems, pageSize) },
+      };
+    });
+
+    return jsonResponse({
+      data: result.data,
+      meta: meta(c.get('requestId'), { requestBuild: build, pagination: result.pagination }),
+    });
+  });
+
+  // GET /invoices/{id} — detail with the weak ETag.
+  app.get('/invoices/:id', async (c) => {
+    const user = c.get('user');
+    const id = c.req.param('id');
+    const build = requestBuildOf(c);
+
+    const result = await withStudioTx(pool, user, async (scoped) => {
+      const loaded = await loadInvoiceRegister(scoped, id);
+      if (!loaded) {
+        return { status: 404 as const };
+      }
+      return {
+        status: 200 as const,
+        invoice: projectInvoiceRegister(
+          loaded.row,
+          loaded.paymentCount,
+          projectCapabilities(user.role).canReadFinance.enabled,
+          user.role,
+          loaded.components,
+          loaded.payments,
+        ),
+        entityVersion: loaded.row.entityVersion,
+      };
+    });
+
+    if (result.status === 404) {
+      return registerReadNotFound(
+        c,
+        'INVOICE_NOT_FOUND',
+        'Invoice not found',
+        'The invoice does not exist in this studio.',
+      );
+    }
+    return jsonResponse(
+      {
+        data: { invoice: result.invoice },
+        meta: meta(c.get('requestId'), { requestBuild: build }),
+      },
+      { headers: { ETag: etagFor(result.entityVersion) } },
+    );
+  });
+
   // --- Clients -----------------------------------------------------------
   app.post('/clients', async (c) => {
     const user = c.get('user');
@@ -939,7 +1752,7 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
         status: 201,
         etag: row.entityVersion,
         body: {
-          data: { vendor: projectVendor(row, Number(poCount[0]?.value ?? 0), user.role) },
+          data: { vendor: projectVendorDetail(row, Number(poCount[0]?.value ?? 0), user.role) },
           meta: mutationMeta(c.get('requestId')),
         },
       };
@@ -1019,7 +1832,7 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
         status: 200,
         etag: updated.entityVersion,
         body: {
-          data: { vendor: projectVendor(updated, Number(poCount[0]?.value ?? 0), user.role) },
+          data: { vendor: projectVendorDetail(updated, Number(poCount[0]?.value ?? 0), user.role) },
           meta: mutationMeta(c.get('requestId')),
         },
       };
@@ -1088,7 +1901,7 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
         etag: row.entityVersion,
         body: {
           data: {
-            specItem: projectSpecItem(
+            specItem: projectSpecItemDetail(
               row,
               projectCapabilities(user.role).canReadFinance.enabled,
               user.role,
@@ -1171,7 +1984,7 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
         etag: updated.entityVersion,
         body: {
           data: {
-            specItem: projectSpecItem(
+            specItem: projectSpecItemDetail(
               updated,
               projectCapabilities(user.role).canReadFinance.enabled,
               user.role,
@@ -1594,6 +2407,7 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
               projectCapabilities(user.role).canReadFinance.enabled,
               user.role,
               loaded.components,
+              loaded.payments,
             ),
           },
           meta: mutationMeta(c.get('requestId')),
@@ -1826,6 +2640,7 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
               projectCapabilities(user.role).canReadFinance.enabled,
               user.role,
               loaded.components,
+              loaded.payments,
             ),
           },
           meta: mutationMeta(c.get('requestId')),

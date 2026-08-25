@@ -1027,3 +1027,262 @@ describe('invoice draft totals (SOL-129)', () => {
     });
   });
 });
+
+describe('register reads (SOL-163)', () => {
+  /** The contract Problem `code` field on an error body. */
+  function codeOf(body: unknown): string | null {
+    if (body && typeof body === 'object' && 'code' in body) {
+      const code = (body as { code: unknown }).code;
+      return typeof code === 'string' ? code : null;
+    }
+    return null;
+  }
+
+  async function createClient(): Promise<{ id: string; entityVersion: string; number: string }> {
+    const number = `REG-${randomUUID().slice(0, 8)}`;
+    const res = await app.request('/clients', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem() },
+      body: JSON.stringify({ clientNumber: number, name: 'Klien Register Read' }),
+    });
+    expect(res.status).toBe(201);
+    const client = ((await res.json()) as any).data.client;
+    return { id: client.id, entityVersion: client.entityVersion, number };
+  }
+
+  async function createVendor(): Promise<{ id: string; entityVersion: string; number: string }> {
+    const number = `REG-${randomUUID().slice(0, 8)}`;
+    const res = await app.request('/vendors', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem() },
+      body: JSON.stringify({ vendorNumber: number, name: 'Supplier Register Read' }),
+    });
+    expect(res.status).toBe(201);
+    const vendor = ((await res.json()) as any).data.vendor;
+    return { id: vendor.id, entityVersion: vendor.entityVersion, number };
+  }
+
+  async function createSpecItem(): Promise<{ id: string; entityVersion: string }> {
+    const res = await app.request('/spec-items', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem() },
+      body: JSON.stringify({
+        name: `REG-SPEC-${randomUUID().slice(0, 8)}`,
+        projectId: SEED_PROJECT,
+        room: 'Ruang baca',
+      }),
+    });
+    expect(res.status).toBe(201);
+    const specItem = ((await res.json()) as any).data.specItem;
+    return { id: specItem.id, entityVersion: specItem.entityVersion };
+  }
+
+  async function createQuotation(): Promise<{ id: string; entityVersion: string; number: string }> {
+    const number = `REG-${randomUUID().slice(0, 8)}`;
+    const res = await app.request('/quotations', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem() },
+      body: JSON.stringify({
+        clientId: SEED_CLIENT,
+        projectId: SEED_PROJECT,
+        engagementId: BUILD_ENGAGEMENT,
+        quotationNumber: number,
+        title: 'Penawaran Register Read',
+      }),
+    });
+    expect(res.status).toBe(201);
+    const quotation = ((await res.json()) as any).data.quotation;
+    return { id: quotation.id, entityVersion: quotation.entityVersion, number };
+  }
+
+  async function createInvoice(): Promise<{ id: string; entityVersion: string; number: string }> {
+    const number = `REG-${randomUUID().slice(0, 8)}`;
+    const res = await app.request('/invoices', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem() },
+      body: JSON.stringify({
+        clientId: SEED_CLIENT,
+        projectId: SEED_PROJECT,
+        invoiceNumber: number,
+      }),
+    });
+    expect(res.status).toBe(201);
+    const invoice = ((await res.json()) as any).data.invoice;
+    return { id: invoice.id, entityVersion: invoice.entityVersion, number };
+  }
+
+  /** The foreign-studio client id (tenant boundary negative). */
+  async function otherClientId(): Promise<string> {
+    let id = '';
+    await tenantQuery(OTHER_STUDIO, async (client) => {
+      const rows = (await client.query(
+        `SELECT id FROM clients WHERE studio_id = $1 AND client_number = 'C-LAIN'`,
+        [OTHER_STUDIO],
+      )) as { rows: { id: string }[] };
+      id = rows.rows[0]?.id ?? '';
+    });
+    expect(id).not.toBe('');
+    return id;
+  }
+
+  afterAll(async () => {
+    await tenantQuery(SEED_STUDIO, async (client) => {
+      await client.query(`DELETE FROM spec_items WHERE name LIKE 'REG-SPEC-%'`);
+    });
+  });
+
+  it('lists clients with pagination and never leaks another studio', async () => {
+    const created = await createClient();
+    const res = await app.request(`/clients?q=${encodeURIComponent(created.number)}`, {
+      headers: auth(),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.data.clients.length).toBe(1);
+    expect(body.data.clients[0].id).toBe(created.id);
+    expect(body.data.clients[0].clientNumber).toBe(created.number);
+    expect(body.data.clients[0].source.type).toBe('client');
+    expect(body.data.clients[0].capabilities.read.enabled).toBe(true);
+    expect(body.meta.pagination.page).toBe(1);
+    expect(body.meta.pagination.pageSize).toBe(10);
+    expect(body.meta.pagination.totalItems).toBeGreaterThanOrEqual(1);
+    expect(body.meta.pagination.totalPages).toBeGreaterThanOrEqual(1);
+
+    // The tenant boundary: no row of the other studio appears on page 1.
+    const all = await app.request('/clients?pageSize=100', { headers: auth() });
+    const allBody = (await all.json()) as any;
+    const foreign = await otherClientId();
+    expect(allBody.data.clients.map((c: { id: string }) => c.id)).not.toContain(foreign);
+  });
+
+  it('paginates the client list', async () => {
+    const res = await app.request('/clients?pageSize=1&page=1', { headers: auth() });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.data.clients.length).toBeLessThanOrEqual(1);
+    expect(body.meta.pagination.page).toBe(1);
+    expect(body.meta.pagination.pageSize).toBe(1);
+    expect(body.meta.pagination.totalPages).toBeGreaterThanOrEqual(1);
+  });
+
+  it('returns client detail with the weak ETag and 404s a foreign id', async () => {
+    const created = await createClient();
+    const res = await app.request(`/clients/${created.id}`, { headers: auth() });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('ETag')).toBe(`W/"${created.entityVersion}"`);
+    const body = (await res.json()) as any;
+    expect(body.data.client.id).toBe(created.id);
+    expect(body.data.client.counts).toHaveProperty('invoices');
+    expect(body.data.client.counts).toHaveProperty('projects');
+    expect(body.data.client.counts).toHaveProperty('quotations');
+
+    const missing = await app.request(`/clients/${randomUUID()}`, { headers: auth() });
+    expect(missing.status).toBe(404);
+    expect(codeOf(await missing.json())).toBe('CLIENT_NOT_FOUND');
+
+    const foreign = await otherClientId();
+    const crossTenant = await app.request(`/clients/${foreign}`, { headers: auth() });
+    expect(crossTenant.status).toBe(404);
+  });
+
+  it('lists and reads vendors; detail carries the required contacts array', async () => {
+    const created = await createVendor();
+    const list = await app.request(`/vendors?q=${encodeURIComponent(created.number)}`, {
+      headers: auth(),
+    });
+    expect(list.status).toBe(200);
+    const listBody = (await list.json()) as any;
+    expect(listBody.data.vendors.length).toBe(1);
+    expect(listBody.data.vendors[0].id).toBe(created.id);
+    expect(listBody.data.vendors[0].source.type).toBe('vendor');
+
+    // The write response now carries VendorDetail.contacts (contract-required).
+    const detail = await app.request(`/vendors/${created.id}`, { headers: auth() });
+    expect(detail.status).toBe(200);
+    expect(detail.headers.get('ETag')).toBe(`W/"${created.entityVersion}"`);
+    const detailBody = (await detail.json()) as any;
+    expect(detailBody.data.vendor.contacts).toEqual([]);
+    expect(detailBody.data.vendor.vendorCode).toBe(created.number);
+
+    const missing = await app.request(`/vendors/${randomUUID()}`, { headers: auth() });
+    expect(missing.status).toBe(404);
+    expect(codeOf(await missing.json())).toBe('VENDOR_NOT_FOUND');
+  });
+
+  it('lists and reads spec items; detail carries the required alternates array', async () => {
+    const created = await createSpecItem();
+    const detail = await app.request(`/spec-items/${created.id}`, { headers: auth() });
+    expect(detail.status).toBe(200);
+    expect(detail.headers.get('ETag')).toBe(`W/"${created.entityVersion}"`);
+    const detailBody = (await detail.json()) as any;
+    expect(detailBody.data.specItem.alternates).toEqual([]);
+    expect(detailBody.data.specItem.projectId).toBe(SEED_PROJECT);
+    expect(detailBody.data.specItem.projectName).toBeTruthy();
+
+    // q matches name/brand; the full register must contain the created row.
+    const all = await app.request('/spec-items?pageSize=100', { headers: auth() });
+    const allBody = (await all.json()) as any;
+    expect(allBody.data.specItems.map((s: { id: string }) => s.id)).toContain(created.id);
+
+    const missing = await app.request(`/spec-items/${randomUUID()}`, { headers: auth() });
+    expect(missing.status).toBe(404);
+    expect(codeOf(await missing.json())).toBe('SPEC_ITEM_NOT_FOUND');
+  });
+
+  it('lists and reads quotations scoped to the studio', async () => {
+    const created = await createQuotation();
+    const list = await app.request(`/quotations?q=${encodeURIComponent(created.number)}`, {
+      headers: auth(),
+    });
+    expect(list.status).toBe(200);
+    const listBody = (await list.json()) as any;
+    expect(listBody.data.quotations.length).toBe(1);
+    expect(listBody.data.quotations[0].id).toBe(created.id);
+    expect(listBody.data.quotations[0].client.id).toBe(SEED_CLIENT);
+    expect(listBody.data.quotations[0].source.type).toBe('quotation');
+    expect(listBody.data.quotations[0].sortKey.length).toBeGreaterThan(0);
+
+    const detail = await app.request(`/quotations/${created.id}`, { headers: auth() });
+    expect(detail.status).toBe(200);
+    expect(detail.headers.get('ETag')).toBe(`W/"${created.entityVersion}"`);
+    const detailBody = (await detail.json()) as any;
+    expect(detailBody.data.quotation.engagementId).toBe(BUILD_ENGAGEMENT);
+
+    const missing = await app.request(`/quotations/${randomUUID()}`, { headers: auth() });
+    expect(missing.status).toBe(404);
+    expect(codeOf(await missing.json())).toBe('QUOTATION_NOT_FOUND');
+  });
+
+  it('lists invoices as the summary shape and reads the detail with payments', async () => {
+    const created = await createInvoice();
+    const list = await app.request(`/invoices?q=${encodeURIComponent(created.number)}`, {
+      headers: auth(),
+    });
+    expect(list.status).toBe(200);
+    const listBody = (await list.json()) as any;
+    expect(listBody.data.invoices.length).toBe(1);
+    const summary = listBody.data.invoices[0];
+    expect(summary.id).toBe(created.id);
+    expect(summary.source.type).toBe('invoice');
+    // The summary forbids the detail-only keys (additionalProperties: false).
+    expect('dueDate' in summary).toBe(false);
+    expect('payments' in summary).toBe(false);
+    expect(typeof summary.outstandingAmountLabel).toBe('string');
+    expect(typeof summary.paidAmountLabel).toBe('string');
+    expect(typeof summary.totalAmountLabel).toBe('string');
+
+    const detail = await app.request(`/invoices/${created.id}`, { headers: auth() });
+    expect(detail.status).toBe(200);
+    expect(detail.headers.get('ETag')).toBe(`W/"${created.entityVersion}"`);
+    const detailBody = (await detail.json()) as any;
+    expect(detailBody.data.invoice.payments).toEqual([]);
+    expect(detailBody.data.invoice.receivableComponents).toEqual([]);
+    // A DRAFT has no due date; the contract types dueDate as [string, "null"].
+    expect(detailBody.data.invoice.dueDate).toBeNull();
+    expect(detailBody.data.invoice.dueDateLabel).toBeNull();
+
+    const missing = await app.request(`/invoices/${randomUUID()}`, { headers: auth() });
+    expect(missing.status).toBe(404);
+    expect(codeOf(await missing.json())).toBe('INVOICE_NOT_FOUND');
+  });
+});
