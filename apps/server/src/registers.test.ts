@@ -179,6 +179,10 @@ afterAll(async () => {
     await client.query(`DELETE FROM clients WHERE client_number LIKE 'REG-%'`);
     await client.query(`DELETE FROM vendors WHERE vendor_code LIKE 'REG-%'`);
     await client.query(`DELETE FROM quotations WHERE quotation_number LIKE 'REG-%'`);
+    await client.query(
+      `DELETE FROM invoice_receivable_components WHERE invoice_id IN
+         (SELECT id FROM invoices WHERE invoice_number LIKE 'REG-%')`,
+    );
     await client.query(`DELETE FROM invoices WHERE invoice_number LIKE 'REG-%'`);
   });
   await pool.end();
@@ -481,5 +485,209 @@ describe('invoice register writes (project link)', () => {
       }),
     });
     expect(res.status).toBe(404);
+  });
+});
+
+describe('invoice draft totals (SOL-129)', () => {
+  /** Creates a bare DRAFT invoice through the API and returns its wire shape. */
+  async function createDraft(): Promise<Record<string, any>> {
+    const res = await app.request('/invoices', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem() },
+      body: JSON.stringify({
+        clientId: SEED_CLIENT,
+        projectId: SEED_PROJECT,
+        invoiceNumber: `REG-${randomUUID().slice(0, 8)}`,
+      }),
+    });
+    expect(res.status).toBe(201);
+    return ((await res.json()) as any).data.invoice;
+  }
+
+  it('creates a DRAFT that carries totalAmount and receivable components', async () => {
+    const res = await app.request('/invoices', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem(), 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientId: SEED_CLIENT,
+        projectId: SEED_PROJECT,
+        invoiceNumber: `REG-${randomUUID().slice(0, 8)}`,
+        totalAmount: '283050000.00',
+        receivableComponents: [
+          { kind: 'DEPOSIT', amount: '100000000' },
+          { kind: 'BALANCE', amount: 183050000.0 },
+        ],
+      }),
+    });
+    expect(res.status).toBe(201);
+    const invoice = ((await res.json()) as any).data.invoice;
+    expect(invoice.status).toBe('DRAFT');
+    // The register projection is label-only; verify storage directly.
+    await tenantQuery(SEED_STUDIO, async (client) => {
+      const inv = (await client.query(`SELECT total_amount FROM invoices WHERE id = $1`, [
+        invoice.id,
+      ])) as { rows: { total_amount: string }[] };
+      expect(inv.rows[0]?.total_amount).toBe('283050000.00');
+      const comps = (await client.query(
+        `SELECT kind, amount FROM invoice_receivable_components
+         WHERE invoice_id = $1 ORDER BY kind`,
+        [invoice.id],
+      )) as { rows: { kind: string; amount: string }[] };
+      expect(comps.rows.map((r) => r.kind)).toEqual(['BALANCE', 'DEPOSIT']);
+      expect(comps.rows.map((r) => r.amount)).toEqual(['183050000.00', '100000000.00']);
+    });
+  });
+
+  it('replaces components and updates the total on a PATCH (replace semantics)', async () => {
+    const invoice = await createDraft();
+    const res = await app.request(`/invoices/${invoice.id}`, {
+      method: 'PATCH',
+      headers: {
+        ...auth(),
+        'Idempotency-Key': idem(),
+        'If-Match': `"${invoice.entityVersion}"`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        totalAmount: '500000.00',
+        receivableComponents: [{ kind: 'RETENTION', amount: '500000.00' }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    await tenantQuery(SEED_STUDIO, async (client) => {
+      const comps = (await client.query(
+        `SELECT kind, amount FROM invoice_receivable_components WHERE invoice_id = $1`,
+        [invoice.id],
+      )) as { rows: { kind: string; amount: string }[] };
+      expect(comps.rows.length).toBe(1);
+      expect(comps.rows[0]?.kind).toBe('RETENTION');
+    });
+  });
+
+  it('rejects component sum != totalAmount with 422 COMPONENT_SUM_MISMATCH', async () => {
+    const res = await app.request('/invoices', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem(), 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientId: SEED_CLIENT,
+        projectId: SEED_PROJECT,
+        invoiceNumber: `REG-${randomUUID().slice(0, 8)}`,
+        totalAmount: '100.00',
+        receivableComponents: [
+          { kind: 'DEPOSIT', amount: '60.00' },
+          { kind: 'BALANCE', amount: '30.00' },
+        ],
+      }),
+    });
+    expect(res.status).toBe(422);
+    const problem = (await res.json()) as any;
+    expect(problem.code).toBe('COMPONENT_SUM_MISMATCH');
+    expect(problem.requestId).toBeTruthy();
+  });
+
+  it('rejects receivableComponents without totalAmount and a non-positive total', async () => {
+    const missingTotal = await app.request('/invoices', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem(), 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientId: SEED_CLIENT,
+        projectId: SEED_PROJECT,
+        invoiceNumber: `REG-${randomUUID().slice(0, 8)}`,
+        receivableComponents: [{ kind: 'DEPOSIT', amount: '10.00' }],
+      }),
+    });
+    expect(missingTotal.status).toBe(422);
+    expect(((await missingTotal.json()) as any).code).toBe('INVALID_INVOICE');
+
+    const zeroTotal = await app.request('/invoices', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem(), 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientId: SEED_CLIENT,
+        projectId: SEED_PROJECT,
+        invoiceNumber: `REG-${randomUUID().slice(0, 8)}`,
+        totalAmount: '0',
+      }),
+    });
+    expect(zeroTotal.status).toBe(422);
+    expect(((await zeroTotal.json()) as any).code).toBe('MONEY_OUT_OF_RANGE');
+  });
+
+  it('rejects an invalid MoneyInput with 422 MONEY_FORMAT_INVALID', async () => {
+    const res = await app.request('/invoices', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem(), 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientId: SEED_CLIENT,
+        projectId: SEED_PROJECT,
+        invoiceNumber: `REG-${randomUUID().slice(0, 8)}`,
+        totalAmount: '.5',
+      }),
+    });
+    expect(res.status).toBe(422);
+    expect(((await res.json()) as any).code).toBe('MONEY_FORMAT_INVALID');
+  });
+
+  it('keeps the guarded contract on a PATCH replay and stale If-Match', async () => {
+    const invoice = await createDraft();
+    const key = idem();
+    const body = JSON.stringify({ totalAmount: '150000.00' });
+    const first = await app.request(`/invoices/${invoice.id}`, {
+      method: 'PATCH',
+      headers: {
+        ...auth(),
+        'Idempotency-Key': key,
+        'If-Match': `"${invoice.entityVersion}"`,
+        'content-type': 'application/json',
+      },
+      body,
+    });
+    expect(first.status).toBe(200);
+    expect(((await first.json()) as any).meta.idempotentReplay).toBe(false);
+    const replay = await app.request(`/invoices/${invoice.id}`, {
+      method: 'PATCH',
+      headers: {
+        ...auth(),
+        'Idempotency-Key': key,
+        'If-Match': `"${invoice.entityVersion}"`,
+        'content-type': 'application/json',
+      },
+      body,
+    });
+    expect(replay.status).toBe(200);
+    expect(((await replay.json()) as any).meta.idempotentReplay).toBe(true);
+    const stale = await app.request(`/invoices/${invoice.id}`, {
+      method: 'PATCH',
+      headers: {
+        ...auth(),
+        'Idempotency-Key': idem(),
+        'If-Match': `"${invoice.entityVersion}"`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ totalAmount: '160000.00' }),
+    });
+    expect(stale.status).toBe(409);
+    const conflict = (await stale.json()) as any;
+    expect(conflict.details.draftPreserved).toBe(true);
+    expect(conflict.details.currentEntityVersion).not.toBe(invoice.entityVersion);
+  });
+
+  it('locks total writes once the invoice leaves DRAFT (409 draftPreserved)', async () => {
+    const invoice = await createDraft();
+    await tenantQuery(SEED_STUDIO, async (client) => {
+      await client.query(`UPDATE invoices SET status = 'ISSUED' WHERE id = $1`, [invoice.id]);
+    });
+    const res = await app.request(`/invoices/${invoice.id}`, {
+      method: 'PATCH',
+      headers: {
+        ...auth(),
+        'Idempotency-Key': idem(),
+        'If-Match': `"${invoice.entityVersion}"`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ totalAmount: '100.00' }),
+    });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as any).details.draftPreserved).toBe(true);
   });
 });
