@@ -69,10 +69,22 @@ export const invoicePayments = pgTable('invoice_payments', {
   invoiceId: uuid('invoice_id')
     .notNull()
     .references(() => invoices.id),
+  /**
+   * SOL-132 split-write columns. `amount` is the cash that actually arrived:
+   * gross less PPh less retensi. `grossAmount` is the invoiced amount the
+   * client settled; `pphAmount` and `retensiAmount` are the parts of that
+   * gross that did not arrive as cash. Invariant: gross = amount + pph +
+   * retensi for every percent-derived row; a plain payment carries nulls.
+   */
   amount: numeric('amount', { precision: 20, scale: 2 }).notNull(),
   paidAt: timestamp('paid_at', { withTimezone: true }).notNull(),
   method: text('method').notNull(),
   reference: text('reference'),
+  grossAmount: numeric('gross_amount', { precision: 20, scale: 2 }),
+  pphAmount: numeric('pph_amount', { precision: 20, scale: 2 }),
+  pphPercent: numeric('pph_percent', { precision: 10, scale: 4 }),
+  retensiAmount: numeric('retensi_amount', { precision: 20, scale: 2 }),
+  retensiPercent: numeric('retensi_percent', { precision: 10, scale: 4 }),
   ...tenantColumns,
 });
 
