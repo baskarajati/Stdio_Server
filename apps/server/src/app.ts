@@ -26,6 +26,7 @@ import { registerDeprecatedRoutes } from './routes/deprecated';
 import { registerFinanceRoutes } from './routes/finance';
 import { registerInvoiceRoutes } from './routes/invoices';
 import { registerProjectRoutes } from './routes/projects';
+import { registerPurchaseOrderRoutes } from './routes/purchase-orders';
 import { registerQuotationRoutes } from './routes/quotations';
 import { registerRegisterRoutes } from './routes/registers';
 import { registerTimesheetRoutes } from './routes/timesheets';
@@ -145,6 +146,9 @@ export function createApp(pool: Pool) {
   // the tax handlers win those two paths; every other shim stays live.
   registerRegisterRoutes(app, pool);
   registerTimesheetRoutes(app, pool);
+
+  // SOL-163 slice 2: the purchase-order workspace reads (register + detail).
+  registerPurchaseOrderRoutes(app, pool);
   registerTaxRoutes(app, pool);
   registerDeprecatedRoutes(app, pool);
 
