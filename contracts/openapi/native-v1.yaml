@@ -1398,10 +1398,16 @@ paths:
   /projects/{id}/engagements/{engagementId}/invoices/{invoiceId}/payment:
     post:
       operationId: recordNativeEngagementInvoicePayment
-      summary: Record one engagement invoice payment. Permanently disabled (SOL-20, A-010).
+      summary: >-
+        Record one engagement invoice payment (SOL-132). The plain payload
+        (amount + date + paymentMethod) records the cash that arrived; an
+        optional percent split (grossAmount plus pphPercent/retensiPercent)
+        also records the PPh and retensi withheld parts on the same row. The
+        capability is OWNER-only; other roles receive 403 CAPABILITY_DENIED.
       parameters:
         - $ref: "#/components/parameters/NativeBuild"
         - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/IdempotencyKey"
         - name: id
           in: path
           required: true
@@ -1417,8 +1423,32 @@ paths:
           required: true
           schema:
             type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProjectFinanceInvoicePaymentRequest"
       responses:
+        "200":
+          description: Idempotent replay of an already-recorded payment. No second row is written.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectFinanceInvoiceWriteResponse"
+        "201":
+          description: Payment recorded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectFinanceInvoiceWriteResponse"
+        "400": { $ref: "#/components/responses/Problem" }
+        "401": { $ref: "#/components/responses/Problem" }
         "403": { $ref: "#/components/responses/Problem" }
+        "404": { $ref: "#/components/responses/Problem" }
+        "409": { $ref: "#/components/responses/MutationConflict" }
+        "422": { $ref: "#/components/responses/Problem" }
+        "426": { $ref: "#/components/responses/Problem" }
   /clients:
     get:
       operationId: listNativeClients
@@ -9839,6 +9869,21 @@ components:
       type: object
     ProjectFinanceInvoicePaymentRequest:
       additionalProperties: false
+      description: >-
+        A payment write against one engagement invoice. `amount` is the cash
+        that arrived. When any of `grossAmount`, `pphPercent` or
+        `retensiPercent` is present, the request is a split: `grossAmount` is
+        required, each percent applies to the gross, and the server derives the
+        withheld parts in exact integer minor units (percent scaled at 10^4
+        parts-per-million, rounded half-up per share). Invariant: `amount` must
+        equal `grossAmount` minus PPh minus retensi; a deviation returns 422
+        PAYMENT_SPLIT_MISMATCH, and shares that exceed the gross return 422
+        PAYMENT_SPLIT_OVER_GROSS. The percent grammar is a decimal with up to
+        four fractional digits in 0..100 (422 PAYMENT_PERCENT_INVALID /
+        PAYMENT_PERCENT_OUT_OF_RANGE otherwise). A plain request (no split
+        fields) records only `amount`; the `payments[]` projection always
+        emits id/amount/amountLabel/date/dateLabel/methodLabel and never the
+        split data, which stays server-side (SOL-132).
       properties:
         amount:
           minLength: 1
@@ -9846,6 +9891,7 @@ components:
         date:
           minLength: 1
           type: string
+          description: ISO 8601 date or timestamp when the cash arrived.
         paymentMethod:
           enum:
             - BANK_TRANSFER
@@ -9854,6 +9900,20 @@ components:
             - QRIS
             - OTHER
           type: string
+        grossAmount:
+          $ref: '#/components/schemas/MoneyInput'
+          description: The invoiced amount the client settled. Required when a percent split is present.
+        pphPercent:
+          type: string
+          pattern: '^\d+(\.\d{1,4})?$'
+          description: PPh withholding as a percent of the gross, 0..100 inclusive, up to four fractional digits.
+        retensiPercent:
+          type: string
+          pattern: '^\d+(\.\d{1,4})?$'
+          description: Retention as a percent of the gross, 0..100 inclusive, up to four fractional digits.
+        reference:
+          type: string
+          description: Free-form payment reference, such as a bank transfer number.
       required:
         - amount
         - date
