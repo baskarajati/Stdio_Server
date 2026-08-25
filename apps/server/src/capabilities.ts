@@ -34,11 +34,6 @@ export type CapabilitySet = Record<CapabilityKey, Capability>;
 /** The tax mode is one of the launch modes. PPN_STANDARD_2025 stays behind SOL-25. */
 export type TaxMode = 'NONE' | 'CUSTOM_UNVERIFIED' | 'PPN_STANDARD_2025';
 
-const DISABLED_PAYMENT =
-  'Payment recording is deferred. SOL-20 defers all PPh withholding and retensi splitting; ' +
-  'A-010 leaves PPh timing on retained cash to an accountant. The amount/date/method payload ' +
-  'cannot represent cash, PPh, and retensi separately.';
-
 /**
  * Projects the native contract capabilities for one staff user.
  *
@@ -47,8 +42,10 @@ const DISABLED_PAYMENT =
  * fields to null). The SOL-28 review gate closed on 2026-08-22 (revision 7
  * concurred, CEO confirmation `b6701b4e`), so the quotation and
  * variation-order writes are enabled for the studio OWNER. Invoice draft and
- * issue stay gated behind SOL-25's approved tax snapshot contract. Payment
- * recording stays permanently disabled (SOL-20, A-010). Reads and
+ * issue carry the SOL-25 tax snapshot contract and are enabled for the studio
+ * OWNER. Payment recording is enabled for the studio OWNER since SOL-132
+ * (CEO confirmation `79974dba`, option B): the split-write payload records
+ * gross cash, PPh percent and retensi percent separately. Reads and
  * collection-control metadata are allowed.
  */
 export function projectCapabilities(role: StudioRole): CapabilitySet {
@@ -88,8 +85,13 @@ export function projectCapabilities(role: StudioRole): CapabilitySet {
       reason: role === 'OWNER' ? '' : 'Only the studio owner can issue an invoice.',
     },
 
-    // Payment recording is deferred by SOL-20 and A-010, whatever the role.
-    canRecordInvoicePayment: { enabled: false, reason: DISABLED_PAYMENT },
+    // SOL-132 (CEO confirmation `79974dba`, option B): the split-payment
+    // write is an ownership decision on money, so only the studio owner
+    // records payments.
+    canRecordInvoicePayment: {
+      enabled: role === 'OWNER',
+      reason: role === 'OWNER' ? '' : 'Only the studio owner can record a payment.',
+    },
 
     // Collection control is control metadata, not a money write (SOL-6).
     canUpdateInvoiceCollection: { enabled: true, reason: '' },
