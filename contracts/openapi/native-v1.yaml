@@ -8629,6 +8629,19 @@ components:
       type: object
     Problem:
       additionalProperties: false
+      description: >-
+        A machine-readable problem (RFC 9457). The generic `details` field is
+        a free-form object. For status 422 with code
+        TAX_APPLICABILITY_CONFIRMATION_INVALID, `details` carries exactly these
+        four fields, present only for this code:
+        `applicabilityConfirmationText` (the current
+        TaxRuleDiscoveryResponse.resolvedVerifiedRule.applicabilityConfirmationText,
+        byte for byte), `applicabilityConfirmationRuleId` (string),
+        `applicabilityConfirmationRuleVersion` (integer >= 1) and
+        `applicabilityConfirmationEntityVersion` (string). A client that
+        receives them re-renders the acknowledgment with the returned text and
+        re-issues with a fresh Idempotency-Key; reusing the failed key with a
+        corrected body returns 409 IDEMPOTENCY_KEY_REUSED.
       properties:
         code:
           type: string
@@ -18245,6 +18258,14 @@ components:
       additionalProperties: false
       required: [transactionInIndonesia, fallsWithinPmk131Article3,
         noSeparateRegimeApplies, pkpStatusConfirmed, acceptedText]
+      description: >-
+        The verified-branch applicability confirmation. `acceptedText` MUST
+        equal TaxRuleDiscoveryResponse.resolvedVerifiedRule.applicabilityConfirmationText
+        byte for byte; that field is the canonical acknowledgment source and
+        the client MUST NOT hardcode or bundle the text. When a rule-version
+        change makes the submitted text stale, the issue operation returns 422
+        TAX_APPLICABILITY_CONFIRMATION_INVALID and Problem.details carries the
+        current text and rule correlates for re-render-and-retry.
       properties:
         transactionInIndonesia: { const: true }
         fallsWithinPmk131Article3: { const: true }

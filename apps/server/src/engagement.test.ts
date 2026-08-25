@@ -78,16 +78,30 @@ async function readEngagementVersion(): Promise<string> {
   });
 }
 
-async function createEligibleChange(): Promise<{ id: string; entityVersion: string }> {
+async function createEligibleChange(
+  engagementId: string = BUILD_ENGAGEMENT,
+): Promise<{ id: string; entityVersion: string }> {
   return tenantQuery(SEED_STUDIO, async (client) => {
     const res = await client.query(
       `INSERT INTO project_changes (id, studio_id, project_id, engagement_id, change_number, change_type, status, title)
        VALUES (gen_random_uuid(), $1, $2, $3, 'PC-' || left(gen_random_uuid()::text, 8), 'SCOPE', 'ELIGIBLE', 'Test change')
        RETURNING id, entity_version`,
-      [SEED_STUDIO, SEED_PROJECT, BUILD_ENGAGEMENT],
+      [SEED_STUDIO, SEED_PROJECT, engagementId],
     );
     const row = res.rows[0] as { id: string; entity_version: string };
     return { id: row.id, entityVersion: row.entity_version };
+  });
+}
+
+async function readEngagementPrice(engagementId: string): Promise<string | null> {
+  return tenantQuery(SEED_STUDIO, async (client) => {
+    const res = await client.query(
+      `SELECT transaction_price FROM project_engagements WHERE id = $1`,
+      [engagementId],
+    );
+    return (
+      (res.rows[0] as { transaction_price?: string | null } | undefined)?.transaction_price ?? null
+    );
   });
 }
 
@@ -153,6 +167,20 @@ beforeAll(async () => {
         transaction_price = '1025000000.00'
        WHERE id = $1`,
       [BUILD_ENGAGEMENT],
+    );
+    // SOL-131: reset the per-studio VO counter so a suite run mints
+    // deterministically (first mint VO-0001, second VO-0002). The seeded
+    // literal VO-001 row is untouched.
+    await client.query(
+      `DELETE FROM studio_number_sequences WHERE studio_id = $1 AND namespace = 'VO'`,
+      [SEED_STUDIO],
+    );
+    // The design engagement carries no money of its own: reset it so the
+    // project finance roll-up is deterministic against the shared database.
+    await client.query(
+      `UPDATE project_engagements SET contract_value = NULL, transaction_price = NULL
+       WHERE id = $1`,
+      [DESIGN_ENGAGEMENT],
     );
   });
 });
@@ -303,6 +331,10 @@ describe('engagement-scoped variation orders', () => {
     expect(payload.data.variationOrder.feeEffect).toBe('5000000.00');
     expect(payload.data.variationOrder.projectChange).toBeTruthy();
 
+    // SOL-131: the mint numbers the document (displayNumber = systemNumber).
+    expect(payload.data.variationOrder.displayNumber).toBe('VO-0001');
+    expect(payload.data.variationOrder.systemNumber).toBe('VO-0001');
+
     // D-033: transaction_price = base (1,000,000,000) + existing approved VO
     // (25,000,000) + this approved VO (5,000,000) = 1,030,000,000.00.
     const after = await readTransactionPrice();
@@ -338,6 +370,11 @@ describe('engagement-scoped variation orders', () => {
 
     const first = await request();
     expect(first.status).toBe(201);
+    const firstPayload = (await first.json()) as any;
+    // SOL-131: the second mint of the suite gets the next number (C4: a
+    // replay returns the stored number without consuming a new one).
+    expect(firstPayload.data.variationOrder.displayNumber).toBe('VO-0002');
+    expect(firstPayload.data.variationOrder.systemNumber).toBe('VO-0002');
     const countAfterFirst = await tenantQuery(SEED_STUDIO, async (client) => {
       const res = await client.query(
         `SELECT count(*)::int AS n FROM variation_orders WHERE project_change_id = $1`,
@@ -350,6 +387,8 @@ describe('engagement-scoped variation orders', () => {
     expect(replay.status).toBe(200);
     const payload = (await replay.json()) as any;
     expect(payload.data.idempotentReplay).toBe(true);
+    expect(payload.data.variationOrder.displayNumber).toBe('VO-0002');
+    expect(payload.data.variationOrder.systemNumber).toBe('VO-0002');
 
     const countAfterReplay = await tenantQuery(SEED_STUDIO, async (client) => {
       const res = await client.query(
@@ -477,6 +516,237 @@ describe('engagement-scoped variation orders', () => {
     expectProblem((await res.json()) as ProblemEnvelope, 404, 'ENGAGEMENT_NOT_FOUND');
   });
 
+  it('SOL-131 C1: concurrent mints on one studio get distinct numbers and full roll-ups', async () => {
+    // The two mints contend only on the per-studio VO counter — the shared
+    // resource C1 serializes. They use two throwaway engagements so the
+    // If-Match version guard (per engagement) does not force a conflict:
+    // both must succeed, with the next two numbers, no duplicate, no 500.
+    // Numbers are never reused (C6): the test reads the counter instead of
+    // resetting it, so the mints take the genuinely next values.
+    const nextValue = await tenantQuery(SEED_STUDIO, async (client) => {
+      const res = await client.query(
+        `SELECT next_value FROM studio_number_sequences WHERE studio_id = $1 AND namespace = 'VO'`,
+        [SEED_STUDIO],
+      );
+      return (res.rows[0] as { next_value?: number } | undefined)?.next_value ?? 1;
+    });
+    const expectedNumbers = new Set([
+      `VO-${String(nextValue).padStart(4, '0')}`,
+      `VO-${String(nextValue + 1).padStart(4, '0')}`,
+    ]);
+
+    const engagementA = randomUUID();
+    const engagementB = randomUUID();
+    await tenantQuery(SEED_STUDIO, async (client) => {
+      for (const engagementId of [engagementA, engagementB]) {
+        // currentPhaseKey 'vo-cleanup-test' marks this row as a throwaway
+        // fixture; the cleanup at the end of the test removes every row with
+        // the marker, so aborted runs never leak engagements into the shared
+        // stdio_dev database (same pattern as budget.test.ts).
+        await client.query(
+          `INSERT INTO project_engagements (id, studio_id, project_id, kind, contract_value, current_phase_key)
+           VALUES ($1, $2, $3, 'DESIGN', '1000000000.00', 'vo-cleanup-test')`,
+          [engagementId, SEED_STUDIO, SEED_PROJECT],
+        );
+      }
+    });
+    const changeA = await createEligibleChange(engagementA);
+    const changeB = await createEligibleChange(engagementB);
+    const versionA = await tenantQuery(SEED_STUDIO, async (client) => {
+      const res = await client.query(
+        `SELECT entity_version FROM project_engagements WHERE id = $1`,
+        [engagementA],
+      );
+      return (res.rows[0] as { entity_version: string }).entity_version;
+    });
+    const versionB = await tenantQuery(SEED_STUDIO, async (client) => {
+      const res = await client.query(
+        `SELECT entity_version FROM project_engagements WHERE id = $1`,
+        [engagementB],
+      );
+      return (res.rows[0] as { entity_version: string }).entity_version;
+    });
+
+    const mint = (
+      engagementId: string,
+      change: { id: string; entityVersion: string },
+      engagementVersion: string,
+      key: string,
+    ) =>
+      app.request(
+        `/projects/${SEED_PROJECT}/engagements/${engagementId}/project-changes/${change.id}/variation-order`,
+        {
+          method: 'POST',
+          headers: {
+            ...auth(),
+            'Idempotency-Key': key,
+            'If-Match': `"${change.entityVersion}", "${engagementVersion}"`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            boqEffect: '10000000.00',
+            contractRevisionId: change.id,
+            effectiveDate: '2026-08-22T00:00:00Z',
+            feeEffect: '5000000.00',
+            scheduleOfValuesId: randomUUID(),
+          }),
+        },
+      );
+
+    const [resA, resB] = await Promise.all([
+      mint(engagementA, changeA, versionA, `vo_conc_a_${randomUUID()}`),
+      mint(engagementB, changeB, versionB, `vo_conc_b_${randomUUID()}`),
+    ]);
+    expect(resA.status).toBe(201);
+    expect(resB.status).toBe(201);
+    const a = (await resA.json()) as any;
+    const b = (await resB.json()) as any;
+    expect(
+      new Set([a.data.variationOrder.displayNumber, b.data.variationOrder.displayNumber]),
+    ).toEqual(expectedNumbers);
+    expect(a.data.variationOrder.systemNumber).toBe(a.data.variationOrder.displayNumber);
+    expect(b.data.variationOrder.systemNumber).toBe(b.data.variationOrder.displayNumber);
+
+    // Each engagement's D-033 roll-up is correct: 1,000M contract value +
+    // its own 5M fee effect = 1,005,000,000.00.
+    expect(await readEngagementPrice(engagementA)).toBe('1005000000.00');
+    expect(await readEngagementPrice(engagementB)).toBe('1005000000.00');
+
+    // No duplicate display numbers anywhere in the studio.
+    const duplicates = await tenantQuery(SEED_STUDIO, async (client) => {
+      const res = await client.query(
+        `SELECT display_number FROM variation_orders
+         WHERE display_number IS NOT NULL
+         GROUP BY display_number HAVING count(*) > 1`,
+      );
+      return res.rows.length;
+    });
+    expect(duplicates).toBe(0);
+
+    // Cleanup: drop the throwaway engagements, their changes and VOs. The
+    // counter is NOT reset — numbers are never reused (C6); the suite's
+    // beforeAll resets it for the next run.
+    await tenantQuery(SEED_STUDIO, async (client) => {
+      await client.query(
+        `DELETE FROM variation_order_approvals
+         WHERE variation_order_id IN (
+           SELECT id FROM variation_orders WHERE project_change_id IN ($1, $2))`,
+        [changeA.id, changeB.id],
+      );
+      await client.query(`DELETE FROM variation_orders WHERE project_change_id IN ($1, $2)`, [
+        changeA.id,
+        changeB.id,
+      ]);
+      await client.query(`DELETE FROM project_changes WHERE id IN ($1, $2)`, [
+        changeA.id,
+        changeB.id,
+      ]);
+      // Marker-based sweep: also removes rows from aborted runs of this
+      // test (an assertion failure before this block leaks them).
+      await client.query(
+        `DELETE FROM project_changes WHERE engagement_id IN
+           (SELECT id FROM project_engagements WHERE current_phase_key = 'vo-cleanup-test')`,
+      );
+      await client.query(
+        `DELETE FROM variation_orders WHERE engagement_id IN
+           (SELECT id FROM project_engagements WHERE current_phase_key = 'vo-cleanup-test')`,
+      );
+      await client.query(
+        `DELETE FROM project_engagements WHERE current_phase_key = 'vo-cleanup-test'`,
+      );
+    });
+  });
+
+  it('SOL-131: a same-engagement concurrent loser gets a typed 409, never a 500', async () => {
+    // Two mints against ONE engagement with the same pre-mint If-Match
+    // version: the version guard means exactly one commits. The loser gets a
+    // typed 409 — the retry converts the first attempt's 40001 into a clean
+    // ENTITY_VERSION_CONFLICT carrying the current version to refetch — never
+    // a bare 500.
+    const nextValue = await tenantQuery(SEED_STUDIO, async (client) => {
+      const res = await client.query(
+        `SELECT next_value FROM studio_number_sequences WHERE studio_id = $1 AND namespace = 'VO'`,
+        [SEED_STUDIO],
+      );
+      return (res.rows[0] as { next_value?: number } | undefined)?.next_value ?? 1;
+    });
+    const expectedWinnerNumber = `VO-${String(nextValue).padStart(4, '0')}`;
+    const changeA = await createEligibleChange();
+    const changeB = await createEligibleChange();
+    const engagementVersion = await readEngagementVersion();
+
+    const mint = (change: { id: string; entityVersion: string }, key: string) =>
+      app.request(
+        `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/project-changes/${change.id}/variation-order`,
+        {
+          method: 'POST',
+          headers: {
+            ...auth(),
+            'Idempotency-Key': key,
+            'If-Match': `"${change.entityVersion}", "${engagementVersion}"`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            boqEffect: '10000000.00',
+            contractRevisionId: change.id,
+            effectiveDate: '2026-08-22T00:00:00Z',
+            feeEffect: '5000000.00',
+            scheduleOfValuesId: randomUUID(),
+          }),
+        },
+      );
+
+    const [resA, resB] = await Promise.all([
+      mint(changeA, `vo_same_a_${randomUUID()}`),
+      mint(changeB, `vo_same_b_${randomUUID()}`),
+    ]);
+    const statuses = [resA.status, resB.status].sort();
+    expect(statuses).toEqual([201, 409]);
+    const winner = resA.status === 201 ? resA : resB;
+    const loser = resA.status === 201 ? resB : resA;
+    // SOL-146: every guarded-write error body is the full Problem envelope;
+    // the refetch version lives in `details.currentEntityVersion`.
+    const loserBody = (await loser.json()) as ProblemEnvelope;
+    expect(loserBody.type).toBe('urn:stdio:error');
+    expect(['CONCURRENT_WRITE_CONFLICT', 'ENTITY_VERSION_CONFLICT']).toContain(loserBody.code);
+    if (loserBody.code === 'ENTITY_VERSION_CONFLICT') {
+      expect(loserBody.details?.currentEntityVersion).toBeTruthy();
+    }
+
+    // The winner minted exactly one numbered VO; the loser minted nothing.
+    const winnerPayload = (await winner.json()) as any;
+    expect(winnerPayload.data.variationOrder.displayNumber).toBe(expectedWinnerNumber);
+    const mintedCount = await tenantQuery(SEED_STUDIO, async (client) => {
+      const res = await client.query(
+        `SELECT count(*)::int AS n FROM variation_orders
+         WHERE project_change_id IN ($1, $2)`,
+        [changeA.id, changeB.id],
+      );
+      return (res.rows[0] as { n?: number }).n;
+    });
+    expect(mintedCount).toBe(1);
+
+    // Cleanup: drop the winner VO and restore the suite baseline
+    // (price 1,035,000,000: base + seed VO + the two sequential test VOs).
+    // The counter keeps its value — the burned number is never reused (C6).
+    const winnerChangeId = winner === resA ? changeA.id : changeB.id;
+    await tenantQuery(SEED_STUDIO, async (client) => {
+      await client.query(
+        `DELETE FROM variation_order_approvals
+         WHERE variation_order_id IN (
+           SELECT id FROM variation_orders WHERE project_change_id = $1)`,
+        [winnerChangeId],
+      );
+      await client.query(`DELETE FROM variation_orders WHERE project_change_id = $1`, [
+        winnerChangeId,
+      ]);
+      await client.query(
+        `UPDATE project_engagements SET transaction_price = '1035000000.00' WHERE id = $1`,
+        [BUILD_ENGAGEMENT],
+      );
+    });
+  });
+
   it('SOL-131: a non-UUID contractRevisionId returns 422, not a bare 500', async () => {
     const engagementVersion = await readEngagementVersion();
     const key = `vo_uuid_${randomUUID()}`;
@@ -590,11 +860,11 @@ describe('project finance roll-up', () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as any;
     const summary = body.data.finance.summary;
-    // 1,185,000,000.00: the cross-engagement roll-up = design engagement
-    // contract 150M (Rumah Pak Andi seed, commit 715c055) + build baseline
+    // 1,035,000,000.00: the cross-engagement roll-up = the build baseline
     // (base 1,000M + seed VO 25M) + the two approved test VOs (5M each)
-    // written earlier in this suite.
-    expect(summary.contractValue).toBe(1185000000);
+    // written earlier in this suite. The suite reset the design engagement
+    // to no money so the roll-up is deterministic against the seed.
+    expect(summary.contractValue).toBe(1035000000);
     expect(summary.variationCount).toBeGreaterThan(0);
   });
 

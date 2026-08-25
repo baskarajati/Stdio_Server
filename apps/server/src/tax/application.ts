@@ -288,7 +288,18 @@ export async function resolveApplication(
       reject(taxRuleVersionStale());
     }
     if (app.confirmation.acceptedText !== (resolved.applicabilityConfirmationText ?? '')) {
-      reject(taxApplicabilityConfirmationInvalid());
+      // SOL-133 (review SOL-138 C1/C3): the typed 422 carries the current
+      // resolve correlates so a stale text can re-render-and-retry without
+      // hardcoding. The catalog tag is validated before this point, so this
+      // branch only fires when the tag is current but the text drifted.
+      reject(
+        taxApplicabilityConfirmationInvalid({
+          ruleId: resolved.id,
+          ruleVersion: resolved.version,
+          entityVersion: resolved.entityVersion,
+          text: resolved.applicabilityConfirmationText ?? '',
+        }),
+      );
     }
     return {
       branch: 'verified',

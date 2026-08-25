@@ -26,6 +26,7 @@ import type { Pool } from 'pg';
 import type { ServerEnv } from '../app';
 import { projectCapabilities } from '../capabilities';
 import { type Db, withStudioTx } from '../context/db';
+import { nextDocumentNumber } from '../document-numbers';
 import {
   capabilityDenied,
   entityConflict,
@@ -567,14 +568,20 @@ export function registerVariationOrderRoutes(app: Hono<ServerEnv>, pool: Pool): 
           const now = new Date();
           const effectiveDate = req.effectiveDate ? new Date(req.effectiveDate as string) : now;
 
+          // SOL-131 (SOL-137 C2, C3): number the document at issue. The
+          // per-studio VO counter is locked at transaction start; the number
+          // is allocated only now, after every validation gate, so a
+          // rejected write consumes no number (C4, C6).
+          const displayNumber = await nextDocumentNumber(scoped, 'VO');
+
           const inserted = await scoped.db
             .insert(variationOrders)
             .values({
               studioId: scoped.studioId,
               projectId,
               engagementId,
-              displayNumber: null,
-              systemNumber: null,
+              displayNumber,
+              systemNumber: displayNumber,
               status: 'ISSUED',
               currency,
               issuedAt: now,
@@ -687,6 +694,8 @@ export function registerVariationOrderRoutes(app: Hono<ServerEnv>, pool: Pool): 
           path: c.req.path,
           flipReplayIdempotent: true,
           replayStatus: 200,
+          numberingNamespace: 'VO',
+          retrySerialization: 3,
         },
       );
 

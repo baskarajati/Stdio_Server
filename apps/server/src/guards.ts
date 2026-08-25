@@ -35,6 +35,7 @@ import type { Pool } from 'pg';
 
 import type { Capability } from './capabilities';
 import { type Db, type RequestUser, withStudioTx } from './context/db';
+import { lockDocumentNumberSequence } from './document-numbers';
 import { problem } from './http';
 import { serializeJson } from './money';
 
@@ -365,12 +366,33 @@ export async function guardedWrite(
      * which the contract reserves for the first execution (201).
      */
     replayStatus?: number;
+    /**
+     * SOL-137 C1: a document-type namespace (`VO`, later `INV`, `QUO`). When
+     * set, the write locks the document counter FIRST — before any query,
+     * and therefore before the SERIALIZABLE snapshot — so concurrent
+     * numbered writes serialize end to end. The handler then allocates the
+     * number via `nextDocumentNumber`.
+     */
+    numberingNamespace?: string;
+    /**
+     * SOL-137 C1: max attempts for the write transaction. A concurrent mint
+     * can abort once with 40001 at the counter upsert even behind the
+     * numbering lock; the retry re-runs from a fresh snapshot and commits.
+     * Defaults to 1 (no retry) for every other guarded write.
+     */
+    retrySerialization?: number;
   },
 ): Promise<GuardedWriteResult> {
   return withStudioTx(
     pool,
     user,
     async (scoped) => {
+      // SOL-137 C1: serialize numbered writes BEFORE the snapshot is
+      // fixed by the first read, so a concurrent numbered write sees the
+      // previous writer's committed counter and roll-up.
+      if (options.numberingNamespace) {
+        await lockDocumentNumberSequence(scoped);
+      }
       await scoped.db.execute(
         sql`SELECT pg_advisory_xact_lock(${lockKey(scoped.studioId, key)}::bigint)`,
       );
@@ -428,6 +450,9 @@ export async function guardedWrite(
         replay: false,
       };
     },
-    options.isolation ? { isolation: options.isolation } : {},
+    {
+      ...(options.isolation ? { isolation: options.isolation } : {}),
+      ...(options.retrySerialization ? { retrySerialization: options.retrySerialization } : {}),
+    },
   );
 }

@@ -12,6 +12,7 @@
 export * from './auth';
 export * from './base';
 export * from './clients';
+export * from './document-sequences';
 export * from './idempotency';
 export * from './invoices';
 export * from './project-changes';
