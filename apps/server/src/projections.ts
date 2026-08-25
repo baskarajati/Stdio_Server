@@ -44,7 +44,25 @@ export function dateLabel(value: Date | string | null | undefined): string | nul
   }).format(date);
 }
 
-/** Humanized status label: `SENT` → `Sent`, `PROGRESS_CERTIFICATE` → `Progress certificate`. */
+/** The descriptive label for one receivable component (SOL-149 R5, option b).
+ * Components render as planned draft structure only; live balances are
+ * invoice-level and cash-derived. The label says which: DEPOSIT and BALANCE
+ * are planned parts; RETENTION is held and not yet due (D-033).
+ */
+export function receivableComponentLabel(kind: string): string {
+  switch (kind) {
+    case 'DEPOSIT':
+      return 'Deposit (planned)';
+    case 'RETENTION':
+      return 'Retention held - receivable, not yet due';
+    case 'BALANCE':
+      return 'Balance (planned)';
+    default:
+      return kind;
+  }
+}
+
+/** Humanized status label: `SENT` to `Sent`, `PROGRESS_CERTIFICATE` to `Progress certificate`. */
 export function statusLabel(status: string | null | undefined): string | null {
   if (status === null || status === undefined) {
     return null;

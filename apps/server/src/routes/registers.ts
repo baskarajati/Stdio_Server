@@ -33,7 +33,13 @@ import type { Db } from '../context/db';
 import { fingerprintFor, guardedWrite, parseIfMatch, requireIdempotencyKey } from '../guards';
 import { etagFor, meta, problem } from '../http';
 import { moneyNumber } from '../money';
-import { dateLabel, moneyLabel, sortKey, statusLabel } from '../projections';
+import {
+  dateLabel,
+  moneyLabel,
+  receivableComponentLabel,
+  sortKey,
+  statusLabel,
+} from '../projections';
 
 const {
   clients,
@@ -614,6 +620,9 @@ function projectInvoiceRegister(
     paidAmountLabel: canReadFinance ? moneyLabel(null, currency) : '',
     receivableComponents: components.map((component) => ({
       kind: component.kind,
+      // SOL-149 R5 (option b): components render as planned draft structure.
+      // The label says which; live balances are invoice-level and cash-derived.
+      label: receivableComponentLabel(component.kind),
       amountLabel: canReadFinance ? moneyLabel(component.amount, currency) : '',
       settledAmountLabel: canReadFinance ? moneyLabel(component.settledAmount, currency) : '',
       outstandingAmountLabel: canReadFinance

@@ -27,6 +27,7 @@ const connectionString =
 const SEED_STUDIO = '00000000-0000-4000-8000-000000000001';
 const SEED_OWNER = '00000000-0000-4000-8000-000000000002';
 const SEED_PROJECT = '00000000-0000-4000-8000-000000000004';
+const SEED_CLIENT = '00000000-0000-4000-8000-000000000003';
 const DESIGN_ENGAGEMENT = '00000000-0000-4000-8000-00000000000e';
 const BUILD_ENGAGEMENT = '00000000-0000-4000-8000-00000000000f';
 const SEED_CHANGE = '00000000-0000-4000-8000-000000000010';
@@ -835,6 +836,57 @@ describe('engagement-scoped variation orders', () => {
 });
 
 describe('engagement-scoped invoices', () => {
+  /** Creates an ISSUED invoice with a known total on the seed project. */
+  async function createIssuedInvoice(totalAmount: string): Promise<string> {
+    return tenantQuery(SEED_STUDIO, async (client) => {
+      const res = (await client.query(
+        `INSERT INTO invoices (id, studio_id, invoice_number, client_id, project_id,
+                               engagement_id, billing_basis, status, currency, issue_date,
+                               due_date, issued_at, total_amount)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'MANUAL', 'ISSUED', 'IDR', '2026-08-20',
+                 '2026-09-03', '2026-08-20T09:00:00Z', $6)
+         RETURNING id`,
+        [
+          SEED_STUDIO,
+          `PAY-${randomUUID().slice(0, 8)}`,
+          SEED_CLIENT,
+          SEED_PROJECT,
+          BUILD_ENGAGEMENT,
+          totalAmount,
+        ],
+      )) as { rows: { id: string }[] };
+      const row = res.rows[0];
+      if (!row) throw new Error('issued invoice fixture missing');
+      return row.id;
+    });
+  }
+
+  /** Creates a DRAFT invoice with a known total on the seed project. */
+  async function createDraftInvoice(totalAmount: string): Promise<string> {
+    return tenantQuery(SEED_STUDIO, async (client) => {
+      const res = (await client.query(
+        `INSERT INTO invoices (id, studio_id, invoice_number, client_id, project_id,
+                               engagement_id, billing_basis, status, currency, total_amount)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'MANUAL', 'DRAFT', 'IDR', $6)
+         RETURNING id`,
+        [
+          SEED_STUDIO,
+          `PAY-${randomUUID().slice(0, 8)}`,
+          SEED_CLIENT,
+          SEED_PROJECT,
+          BUILD_ENGAGEMENT,
+          totalAmount,
+        ],
+      )) as { rows: { id: string }[] };
+      const row = res.rows[0];
+      if (!row) throw new Error('draft invoice fixture missing');
+      return row.id;
+    });
+  }
+
+  const paymentUrl = (invoiceId: string) =>
+    `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${invoiceId}/payment`;
+
   it('lists the engagement invoice register', async () => {
     const res = await app.request(
       `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices`,
@@ -845,35 +897,36 @@ describe('engagement-scoped invoices', () => {
     expect(Array.isArray(body.data.invoices)).toBe(true);
   });
 
-  it('records a plain payment on the OWNER capability (SOL-132)', async () => {
+  it('records a plain payment on an ISSUED invoice (SOL-132)', async () => {
+    const invoiceId = await createIssuedInvoice('300000.00');
     const reference = `plain-${randomUUID()}`;
-    const res = await app.request(
-      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${SEED_INVOICE}/payment`,
-      {
-        method: 'POST',
-        headers: {
-          ...auth(),
-          'Content-Type': 'application/json',
-          'Idempotency-Key': `pay-${randomUUID()}`,
-        },
-        body: JSON.stringify({
-          amount: '100000.00',
-          date: '2026-08-22',
-          paymentMethod: 'BANK_TRANSFER',
-          reference,
-        }),
+    const res = await app.request(paymentUrl(invoiceId), {
+      method: 'POST',
+      headers: {
+        ...auth(),
+        'Content-Type': 'application/json',
+        'Idempotency-Key': `pay-${randomUUID()}`,
       },
-    );
+      body: JSON.stringify({
+        amount: '100000.00',
+        date: '2026-08-22',
+        paymentMethod: 'BANK_TRANSFER',
+        reference,
+      }),
+    });
     expect(res.status).toBe(201);
     const body = (await res.json()) as any;
     expect(body.meta.idempotentReplay).toBe(false);
     const invoice = body.data.invoice;
-    expect(invoice.payments.length).toBeGreaterThanOrEqual(2);
+    expect(invoice.payments.length).toBe(1);
+    // R5b: live balances are invoice-level and cash-derived.
+    expect(invoice.paidAmountLabel).not.toBeNull();
+    expect(invoice.outstandingAmountLabel).not.toBeNull();
     const stored = await tenantQuery(SEED_STUDIO, async (client) => {
       const rows = (await client.query(
         `SELECT amount, gross_amount, pph_amount, retensi_amount
          FROM invoice_payments WHERE invoice_id = $1 AND reference = $2`,
-        [SEED_INVOICE, reference],
+        [invoiceId, reference],
       )) as { rows: Record<string, string | null>[] };
       return rows.rows[0] ?? {};
     });
@@ -883,29 +936,30 @@ describe('engagement-scoped invoices', () => {
     expect(stored.retensi_amount).toBeNull();
   });
 
-  it('records a split payment and derives cash = gross - pph - retensi (SOL-132)', async () => {
-    // A 10000.00 gross termin with 2% PPh withholding and 5% retensi held.
+  it('records an amount-first split payment (SOL-149 R2)', async () => {
+    const invoiceId = await createIssuedInvoice('300000.00');
+    // A 10000.00 gross termin with 200.00 entered PPh and 500.00 entered
+    // retensi. The percents are unverified metadata, never arithmetic.
     const reference = `split-${randomUUID()}`;
-    const res = await app.request(
-      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${SEED_INVOICE}/payment`,
-      {
-        method: 'POST',
-        headers: {
-          ...auth(),
-          'Content-Type': 'application/json',
-          'Idempotency-Key': `pay-${randomUUID()}`,
-        },
-        body: JSON.stringify({
-          amount: '9300.00',
-          date: '2026-08-23',
-          paymentMethod: 'BANK_TRANSFER',
-          reference,
-          grossAmount: '10000.00',
-          pphPercent: '2.0000',
-          retensiPercent: '5.0000',
-        }),
+    const res = await app.request(paymentUrl(invoiceId), {
+      method: 'POST',
+      headers: {
+        ...auth(),
+        'Content-Type': 'application/json',
+        'Idempotency-Key': `pay-${randomUUID()}`,
       },
-    );
+      body: JSON.stringify({
+        amount: '9300.00',
+        date: '2026-08-23',
+        paymentMethod: 'BANK_TRANSFER',
+        reference,
+        grossAmount: '10000.00',
+        pphAmount: '200.00',
+        retensiAmount: '500.00',
+        pphPercent: '2.0000',
+        retensiPercent: '5.0000',
+      }),
+    });
     if (res.status !== 201) {
       console.log('SPLIT BODY', JSON.stringify(await res.json()));
     }
@@ -914,40 +968,70 @@ describe('engagement-scoped invoices', () => {
       const rows = (await client.query(
         `SELECT amount, gross_amount, pph_percent, pph_amount, retensi_percent, retensi_amount
          FROM invoice_payments WHERE invoice_id = $1 AND reference = $2`,
-        [SEED_INVOICE, reference],
+        [invoiceId, reference],
       )) as { rows: Record<string, string | null>[] };
       return rows.rows[0] ?? {};
     });
-    // Exact rational arithmetic in integer minor units: 200.00 PPh,
-    // 500.00 retensi, 9300.00 cash. No cent is lost to floats.
+    // The entered amounts are stored exactly; the percent metadata rides along.
     expect(stored.gross_amount).toBe('10000.00');
-    expect(stored.pph_percent).toBe('2.0000');
     expect(stored.pph_amount).toBe('200.00');
-    expect(stored.retensi_percent).toBe('5.0000');
+    expect(stored.pph_percent).toBe('2.0000');
     expect(stored.retensi_amount).toBe('500.00');
+    expect(stored.retensi_percent).toBe('5.0000');
     expect(stored.amount).toBe('9300.00');
   });
 
+  it('never derives a PPh amount from a percent (SOL-149 R2)', async () => {
+    const invoiceId = await createIssuedInvoice('300000.00');
+    // The percent (2%) disagrees with the entered amount (1000.00). The
+    // entered amount must win; the percent is stored as metadata only.
+    const reference = `noderive-${randomUUID()}`;
+    const res = await app.request(paymentUrl(invoiceId), {
+      method: 'POST',
+      headers: {
+        ...auth(),
+        'Content-Type': 'application/json',
+        'Idempotency-Key': `pay-${randomUUID()}`,
+      },
+      body: JSON.stringify({
+        amount: '9000.00',
+        date: '2026-08-23',
+        paymentMethod: 'BANK_TRANSFER',
+        reference,
+        grossAmount: '10000.00',
+        pphAmount: '1000.00',
+        pphPercent: '2.0000',
+      }),
+    });
+    expect(res.status).toBe(201);
+    const stored = await tenantQuery(SEED_STUDIO, async (client) => {
+      const rows = (await client.query(
+        `SELECT pph_amount, pph_percent FROM invoice_payments
+         WHERE invoice_id = $1 AND reference = $2`,
+        [invoiceId, reference],
+      )) as { rows: Record<string, string | null>[] };
+      return rows.rows[0] ?? {};
+    });
+    // 1000.00 entered, never 200.00 (2% of 10000.00).
+    expect(stored.pph_amount).toBe('1000.00');
+    expect(stored.pph_percent).toBe('2.0000');
+  });
+
   it('replays an idempotent payment retry with 200 and no second row', async () => {
+    const invoiceId = await createIssuedInvoice('1000.00');
     const key = `pay-${randomUUID()}`;
     const payload = JSON.stringify({ amount: '111.00', date: '2026-08-23', paymentMethod: 'CASH' });
-    const first = await app.request(
-      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${SEED_INVOICE}/payment`,
-      {
-        method: 'POST',
-        headers: { ...auth(), 'Content-Type': 'application/json', 'Idempotency-Key': key },
-        body: payload,
-      },
-    );
+    const first = await app.request(paymentUrl(invoiceId), {
+      method: 'POST',
+      headers: { ...auth(), 'Content-Type': 'application/json', 'Idempotency-Key': key },
+      body: payload,
+    });
     expect(first.status).toBe(201);
-    const replay = await app.request(
-      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${SEED_INVOICE}/payment`,
-      {
-        method: 'POST',
-        headers: { ...auth(), 'Content-Type': 'application/json', 'Idempotency-Key': key },
-        body: payload,
-      },
-    );
+    const replay = await app.request(paymentUrl(invoiceId), {
+      method: 'POST',
+      headers: { ...auth(), 'Content-Type': 'application/json', 'Idempotency-Key': key },
+      body: payload,
+    });
     expect(replay.status).toBe(200);
     expect(((await replay.json()) as any).meta.idempotentReplay).toBe(true);
     const counted = await tenantQuery(SEED_STUDIO, async (client) => {
@@ -964,96 +1048,187 @@ describe('engagement-scoped invoices', () => {
     expect(counted).toBe(1);
   });
 
-  it('rejects a split whose derived cash disagrees with amount (SOL-132)', async () => {
-    const res = await app.request(
-      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${SEED_INVOICE}/payment`,
-      {
-        method: 'POST',
-        headers: {
-          ...auth(),
-          'Content-Type': 'application/json',
-          'Idempotency-Key': `pay-${randomUUID()}`,
-        },
-        body: JSON.stringify({
-          amount: '9999.00',
-          date: '2026-08-23',
-          paymentMethod: 'BANK_TRANSFER',
-          grossAmount: '10000.00',
-          pphPercent: '2.0000',
-          retensiPercent: '5.0000',
-        }),
+  it('rejects a split whose entered cash disagrees with amount (SOL-149 R2)', async () => {
+    const invoiceId = await createIssuedInvoice('300000.00');
+    const res = await app.request(paymentUrl(invoiceId), {
+      method: 'POST',
+      headers: {
+        ...auth(),
+        'Content-Type': 'application/json',
+        'Idempotency-Key': `pay-${randomUUID()}`,
       },
-    );
+      body: JSON.stringify({
+        amount: '9999.00',
+        date: '2026-08-23',
+        paymentMethod: 'BANK_TRANSFER',
+        grossAmount: '10000.00',
+        pphAmount: '200.00',
+        retensiAmount: '500.00',
+      }),
+    });
     expect(res.status).toBe(422);
     const body = (await res.json()) as any;
     expect(body.code).toBe('PAYMENT_SPLIT_MISMATCH');
   });
 
-  it('rejects percent-derived splits without a gross amount', async () => {
-    const res = await app.request(
-      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${SEED_INVOICE}/payment`,
-      {
-        method: 'POST',
-        headers: {
-          ...auth(),
-          'Content-Type': 'application/json',
-          'Idempotency-Key': `pay-${randomUUID()}`,
-        },
-        body: JSON.stringify({
-          amount: '100.00',
-          date: '2026-08-23',
-          paymentMethod: 'CASH',
-          pphPercent: '2.0000',
-        }),
+  it('rejects a payment on a DRAFT invoice (SOL-149 R5b)', async () => {
+    const invoiceId = await createDraftInvoice('100000.00');
+    const res = await app.request(paymentUrl(invoiceId), {
+      method: 'POST',
+      headers: {
+        ...auth(),
+        'Content-Type': 'application/json',
+        'Idempotency-Key': `pay-${randomUUID()}`,
       },
-    );
+      body: JSON.stringify({ amount: '100.00', date: '2026-08-23', paymentMethod: 'CASH' }),
+    });
+    expect(res.status).toBe(422);
+    const body = (await res.json()) as any;
+    expect(body.code).toBe('PAYMENT_INVOICE_NOT_ISSUED');
+    expect(body.detail).toContain('DRAFT');
+  });
+
+  it('rejects a second payment that exceeds the invoice total (SOL-149 R5b)', async () => {
+    const invoiceId = await createIssuedInvoice('100000.00');
+    const first = await app.request(paymentUrl(invoiceId), {
+      method: 'POST',
+      headers: {
+        ...auth(),
+        'Content-Type': 'application/json',
+        'Idempotency-Key': `pay-${randomUUID()}`,
+      },
+      body: JSON.stringify({
+        amount: '60000.00',
+        date: '2026-08-23',
+        paymentMethod: 'BANK_TRANSFER',
+      }),
+    });
+    expect(first.status).toBe(201);
+
+    const over = await app.request(paymentUrl(invoiceId), {
+      method: 'POST',
+      headers: {
+        ...auth(),
+        'Content-Type': 'application/json',
+        'Idempotency-Key': `pay-${randomUUID()}`,
+      },
+      body: JSON.stringify({
+        amount: '50000.00',
+        date: '2026-08-24',
+        paymentMethod: 'BANK_TRANSFER',
+      }),
+    });
+    expect(over.status).toBe(422);
+    const body = (await over.json()) as any;
+    expect(body.code).toBe('PAYMENT_OVER_TOTAL');
+    expect(body.details.paidAmount).toBe('60000.00');
+    expect(body.details.outstandingAmount).toBe('40000.00');
+    expect(body.details.attemptedAmount).toBe('50000.00');
+  });
+
+  it('rejects a second full payment against a fully paid invoice (W3 pilot regression)', async () => {
+    // The W3 pilot bug: a second POST with a different Idempotency-Key
+    // recorded a second full payment (Rp 649.350.000 against a total of
+    // Rp 324.675.000). The overpayment guard must reject it.
+    const invoiceId = await createIssuedInvoice('324675000.00');
+    const first = await app.request(paymentUrl(invoiceId), {
+      method: 'POST',
+      headers: {
+        ...auth(),
+        'Content-Type': 'application/json',
+        'Idempotency-Key': `pay-${randomUUID()}`,
+      },
+      body: JSON.stringify({
+        amount: '324675000.00',
+        date: '2026-08-24',
+        paymentMethod: 'BANK_TRANSFER',
+      }),
+    });
+    expect(first.status).toBe(201);
+    const second = await app.request(paymentUrl(invoiceId), {
+      method: 'POST',
+      headers: {
+        ...auth(),
+        'Content-Type': 'application/json',
+        'Idempotency-Key': `pay-${randomUUID()}`,
+      },
+      body: JSON.stringify({
+        amount: '324675000.00',
+        date: '2026-08-25',
+        paymentMethod: 'BANK_TRANSFER',
+      }),
+    });
+    expect(second.status).toBe(422);
+    const body = (await second.json()) as any;
+    expect(body.code).toBe('PAYMENT_OVER_TOTAL');
+    const paid = await tenantQuery(SEED_STUDIO, async (client) => {
+      const res = (await client.query(
+        `SELECT COALESCE(SUM((amount)::numeric), 0)::text AS paid
+         FROM invoice_payments WHERE invoice_id = $1`,
+        [invoiceId],
+      )) as { rows: { paid: string }[] };
+      const row = res.rows[0];
+      if (!row) throw new Error('paid sum missing');
+      return row.paid;
+    });
+    // Cash never exceeded the total: one full payment, not two.
+    expect(paid).toBe('324675000.00');
+  });
+
+  it('rejects percent-derived splits without a gross amount', async () => {
+    const invoiceId = await createIssuedInvoice('300000.00');
+    const res = await app.request(paymentUrl(invoiceId), {
+      method: 'POST',
+      headers: {
+        ...auth(),
+        'Content-Type': 'application/json',
+        'Idempotency-Key': `pay-${randomUUID()}`,
+      },
+      body: JSON.stringify({
+        amount: '100.00',
+        date: '2026-08-23',
+        paymentMethod: 'CASH',
+        pphPercent: '2.0000',
+      }),
+    });
     expect(res.status).toBe(422);
     expect(((await res.json()) as any).code).toBe('PAYMENT_GROSS_REQUIRED');
   });
 
   it('rejects a negative amount and an over-gross split', async () => {
-    const negative = await app.request(
-      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${SEED_INVOICE}/payment`,
-      {
-        method: 'POST',
-        headers: {
-          ...auth(),
-          'Content-Type': 'application/json',
-          'Idempotency-Key': `pay-${randomUUID()}`,
-        },
-        body: JSON.stringify({ amount: '-5.00', date: '2026-08-23', paymentMethod: 'CASH' }),
+    const invoiceId = await createIssuedInvoice('300000.00');
+    const negative = await app.request(paymentUrl(invoiceId), {
+      method: 'POST',
+      headers: {
+        ...auth(),
+        'Content-Type': 'application/json',
+        'Idempotency-Key': `pay-${randomUUID()}`,
       },
-    );
+      body: JSON.stringify({ amount: '-5.00', date: '2026-08-23', paymentMethod: 'CASH' }),
+    });
     expect(negative.status).toBe(422);
     expect(((await negative.json()) as any).code).toBe('MONEY_OUT_OF_RANGE');
 
-    const over = await app.request(
-      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${SEED_INVOICE}/payment`,
-      {
-        method: 'POST',
-        headers: {
-          ...auth(),
-          'Content-Type': 'application/json',
-          'Idempotency-Key': `pay-${randomUUID()}`,
-        },
-        body: JSON.stringify({
-          // 60% PPh + 50% retensi = 110% of the gross, so the derived cash
-          // goes negative (-500.00) and PAYMENT_SPLIT_OVER_GROSS must fire.
-          // A non-positive amount cannot reach this stage (rejected above),
-          // so a tiny positive amount carries the mismatch branch instead.
-          amount: '1.00',
-          date: '2026-08-23',
-          paymentMethod: 'BANK_TRANSFER',
-          grossAmount: '10000.00',
-          pphPercent: '60.0000',
-          retensiPercent: '50.0000',
-        }),
+    const over = await app.request(paymentUrl(invoiceId), {
+      method: 'POST',
+      headers: {
+        ...auth(),
+        'Content-Type': 'application/json',
+        'Idempotency-Key': `pay-${randomUUID()}`,
       },
-    );
+      body: JSON.stringify({
+        // 6000.00 PPh + 5000.00 retensi = 110% of the gross, so the derived
+        // cash goes negative (-1000.00) and PAYMENT_SPLIT_OVER_GROSS fires.
+        amount: '1.00',
+        date: '2026-08-23',
+        paymentMethod: 'BANK_TRANSFER',
+        grossAmount: '10000.00',
+        pphAmount: '6000.00',
+        retensiAmount: '5000.00',
+      }),
+    });
     expect(over.status).toBe(422);
     const overBody = (await over.json()) as any;
-    // The derived cash is negative (-1000.00 = 10000 - 6000 - 5000), so the
-    // route answers PAYMENT_SPLIT_OVER_GROSS regardless of the stated amount.
     expect(overBody.code).toBe('PAYMENT_SPLIT_OVER_GROSS');
     expect(overBody.details.derivedCash).toBe('-1000.00');
   });

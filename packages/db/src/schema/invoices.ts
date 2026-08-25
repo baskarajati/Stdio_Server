@@ -70,11 +70,13 @@ export const invoicePayments = pgTable('invoice_payments', {
     .notNull()
     .references(() => invoices.id),
   /**
-   * SOL-132 split-write columns. `amount` is the cash that actually arrived:
-   * gross less PPh less retensi. `grossAmount` is the invoiced amount the
-   * client settled; `pphAmount` and `retensiAmount` are the parts of that
-   * gross that did not arrive as cash. Invariant: gross = amount + pph +
-   * retensi for every percent-derived row; a plain payment carries nulls.
+   * SOL-132/SOL-149 split-write columns. `amount` is the cash that actually
+   * arrived. `grossAmount` is the invoiced amount the client settled;
+   * `pphAmount` and `retensiAmount` are the ENTERED withheld parts (SOL-149
+   * R2): the payee-stated PPh and the contractual retention, never derived
+   * from a percent. `pphPercent` and `retensiPercent` are unverified
+   * metadata only and never arithmetic inputs. Invariant: gross = amount +
+   * pph + retensi for every split row; a plain payment carries nulls.
    */
   amount: numeric('amount', { precision: 20, scale: 2 }).notNull(),
   paidAt: timestamp('paid_at', { withTimezone: true }).notNull(),

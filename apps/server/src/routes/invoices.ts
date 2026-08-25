@@ -4,10 +4,15 @@
  * Invoice reads and collection-control metadata are engagement-scoped and
  * open. Invoice draft and issue writes carry the SOL-25 tax snapshot contract
  * and stay capability-denied until SOL-25's approved contract lands
- * (`canWriteInvoiceDraft`, `canIssueInvoice`). The SOL-132 split-payment
- * write (CEO confirmation `79974dba`, option B) is OWNER-gated: it records
- * gross settled, PPh percent withheld, retensi percent held and the exact
- * cash that arrived on one row of `invoice_payments`.
+ * (`canWriteInvoiceDraft`, `canIssueInvoice`). The split-payment write
+ * (SOL-132 CEO confirmation `79974dba`, amended by ruling SOL-149) is
+ * OWNER-gated: it records the gross settled, the entered PPh and retensi
+ * amounts, the entered percent metadata and the exact cash that arrived on
+ * one row of `invoice_payments`. The write is amount-first (SOL-149 R2):
+ * `pphAmount` and `retensiAmount` are entered facts; `pphPercent` and
+ * `retensiPercent` are unverified metadata and never arithmetic inputs.
+ * Payments require an issued invoice and cumulative cash at or below the
+ * invoice total (SOL-149 R5b).
  *
  * Money wire: `ProjectFinanceInvoice` declares NUMBER-form money, so the
  * server emits `RawDecimal` via `serializeJson` and derives the `*Label`
@@ -15,7 +20,6 @@
  */
 
 import {
-  divideRounded,
   MoneyInputError,
   money,
   moneyFromDecimal,
@@ -40,7 +44,7 @@ import {
 } from '../guards';
 import { etagFor, meta, problem } from '../http';
 import { jsonResponse, moneyNumber, RawDecimal } from '../money';
-import { dateLabel, moneyLabel, statusLabel } from '../projections';
+import { dateLabel, moneyLabel, receivableComponentLabel, statusLabel } from '../projections';
 
 const { invoices, invoicePayments, invoiceReceivableComponents, users } = schema;
 
@@ -142,6 +146,7 @@ function projectInvoice(
       amount: num(c.amount),
       amountLabel: label(c.amount),
       kind: c.kind,
+      label: receivableComponentLabel(c.kind),
       outstandingAmount: num(c.amount),
       outstandingAmountLabel: label(c.amount),
       settledAmount: num(c.settledAmount),
@@ -464,10 +469,12 @@ export function registerInvoiceRoutes(app: Hono<ServerEnv>, pool: Pool): void {
   });
 
   // POST /projects/{id}/engagements/{engId}/invoices/{invoiceId}/payment
-  // — SOL-132 split-payment write (CEO confirmation `79974dba`, option B).
-  // The payload carries the cash that arrived plus an optional gross /
-  // PPh-percent / retensi-percent split; the server derives the withheld
-  // parts in exact integer minor units and stores all of them on one row.
+  // — SOL-132 split-payment write (CEO confirmation `79974dba`, amended by
+  // ruling SOL-149). Amount-first: the payload carries the cash that arrived
+  // plus optional entered split facts — grossAmount, pphAmount, retensiAmount
+  // — and optional unverified percent metadata (pphPercent, retensiPercent),
+  // which never drives arithmetic. Payments require an ISSUED (or PAID)
+  // invoice, and cumulative cash may not exceed the invoice total (R5b).
   app.post('/projects/:id/engagements/:engId/invoices/:invoiceId/payment', async (c) => {
     const user = c.get('user');
     const projectId = c.req.param('id');
@@ -521,7 +528,12 @@ export function registerInvoiceRoutes(app: Hono<ServerEnv>, pool: Pool): void {
           };
         }
         const invoices_ = await scoped.db
-          .select({ id: invoices.id })
+          .select({
+            id: invoices.id,
+            status: invoices.status,
+            currency: invoices.currency,
+            totalAmount: invoices.totalAmount,
+          })
           .from(invoices)
           .where(and(eq(invoices.id, invoiceId), eq(invoices.engagementId, engagementId)))
           .for('update')
@@ -536,7 +548,19 @@ export function registerInvoiceRoutes(app: Hono<ServerEnv>, pool: Pool): void {
             },
           };
         }
-        // --- Money stage: strict parse, then exact rational derivation. ---
+        // SOL-149 R5b / D-007: receivables count from ISSUED onward. A payment
+        // requires an issued invoice; DRAFT, VOIDED and unknown states are
+        // rejected with the named code.
+        if (invoice.status !== 'ISSUED' && invoice.status !== 'PAID') {
+          return {
+            status: 422,
+            body: {
+              code: 'PAYMENT_INVOICE_NOT_ISSUED',
+              detail: `Payments require an issued invoice; this invoice is ${invoice.status}.`,
+            },
+          };
+        }
+        // --- Money stage: strict parse of the entered amounts. ---
         if (typeof req.amount !== 'string' && typeof req.amount !== 'number') {
           return {
             status: 422,
@@ -570,6 +594,8 @@ export function registerInvoiceRoutes(app: Hono<ServerEnv>, pool: Pool): void {
 
         const hasSplit =
           req.grossAmount !== undefined ||
+          req.pphAmount !== undefined ||
+          req.retensiAmount !== undefined ||
           req.pphPercent !== undefined ||
           req.retensiPercent !== undefined;
         let grossMinor = amountMinor;
@@ -579,13 +605,17 @@ export function registerInvoiceRoutes(app: Hono<ServerEnv>, pool: Pool): void {
         let retensiPercentText: string | null = null;
 
         if (hasSplit) {
+          // SOL-149 R2: the split inputs are the entered amounts. The gross
+          // is the invoiced amount the client settled; PPh and retensi are
+          // the withheld parts stated by the payee (bukti potong / berita
+          // acara) and the contract. Nothing here is percent-derived.
           if (req.grossAmount === undefined) {
             return {
               status: 422,
               body: {
                 code: 'PAYMENT_GROSS_REQUIRED',
                 detail:
-                  'A percent split requires grossAmount; the percent applies to the settled gross.',
+                  'A split payment requires grossAmount; the entered PPh and retensi amounts settle against the gross.',
               },
             };
           }
@@ -594,6 +624,42 @@ export function registerInvoiceRoutes(app: Hono<ServerEnv>, pool: Pool): void {
           } catch (error) {
             return { status: 422, body: moneyFromError(error) };
           }
+          for (const [field, target] of [
+            ['pphAmount', 'pph'],
+            ['retensiAmount', 'retensi'],
+          ] as const) {
+            const raw = req[field];
+            if (raw === undefined) continue;
+            if (typeof raw !== 'string' && typeof raw !== 'number') {
+              return {
+                status: 422,
+                body: moneyInvalid(`${field} must be a string or a number.`),
+              };
+            }
+            let minor: bigint;
+            try {
+              minor = parseStrictMoneyInput(raw as string | number);
+            } catch (error) {
+              return { status: 422, body: moneyFromError(error) };
+            }
+            if (minor < 0n) {
+              return {
+                status: 422,
+                body: {
+                  code: 'MONEY_OUT_OF_RANGE',
+                  detail: `${field} must not be negative.`,
+                },
+              };
+            }
+            if (target === 'pph') {
+              pphAmountMinor = minor;
+            } else {
+              retensiAmountMinor = minor;
+            }
+          }
+          // Percent fields are unverified metadata (SOL-149 R2, A-010): the
+          // grammar is validated for storage, but no amount is derived from
+          // them and they are never checked against the entered amounts.
           for (const [field, target] of [
             ['pphPercent', 'pph'],
             ['retensiPercent', 'retensi'],
@@ -633,13 +699,10 @@ export function registerInvoiceRoutes(app: Hono<ServerEnv>, pool: Pool): void {
                 },
               };
             }
-            const shareMinor = divideRounded(grossMinor * scaled, 1000000n, 'half-up');
             if (target === 'pph') {
               pphPercentText = percentText;
-              pphAmountMinor = shareMinor;
             } else {
               retensiPercentText = percentText;
-              retensiAmountMinor = shareMinor;
             }
           }
           const derivedCashMinor = grossMinor - pphAmountMinor - retensiAmountMinor;
@@ -665,6 +728,42 @@ export function registerInvoiceRoutes(app: Hono<ServerEnv>, pool: Pool): void {
               },
             };
           }
+        }
+
+        // SOL-149 R5b: cumulative cash after this payment must not exceed the
+        // invoice total. The `FOR UPDATE` invoice-row lock serializes
+        // concurrent payments, so the summed cash is read after the lock.
+        if (invoice.totalAmount === null) {
+          return {
+            status: 422,
+            body: {
+              code: 'INVOICE_TOTAL_REQUIRED',
+              detail: 'A payment requires an invoice total; this invoice has none.',
+            },
+          };
+        }
+        const currency = invoice.currency ?? 'IDR';
+        const totalMinor = moneyFromDecimal(invoice.totalAmount, currency).amount;
+        const paidRows = await scoped.db
+          .select({ amount: invoicePayments.amount })
+          .from(invoicePayments)
+          .where(eq(invoicePayments.invoiceId, invoice.id));
+        const cumulativeMinor = paidRows.reduce(
+          (acc, p) => acc + (p.amount ? moneyFromDecimal(p.amount, currency).amount : 0n),
+          0n,
+        );
+        if (cumulativeMinor + amountMinor > totalMinor) {
+          return {
+            status: 422,
+            body: {
+              code: 'PAYMENT_OVER_TOTAL',
+              detail: 'This payment would exceed the invoice total.',
+              totalAmount: moneyOutput(totalMinor),
+              paidAmount: moneyOutput(cumulativeMinor),
+              outstandingAmount: moneyOutput(totalMinor - cumulativeMinor),
+              attemptedAmount: moneyOutput(amountMinor),
+            },
+          };
         }
 
         const inserted = await scoped.db
@@ -756,12 +855,10 @@ function moneyInvalid(detail: string): { code: string; detail: string } {
 
 /**
  * Scales a percent decimal with up to four fractional digits to
- * parts-per-million of the gross (percent x 10^4), exactly:
+ * parts-per-million (percent x 10^4), exactly:
  * "2" -> 20000, "2.5" -> 25000, "0.0001" -> 1, "100" -> 1000000.
- * The caller divides grossMinor * scaled by 10^6, so a share stays an exact
- * integer minor-unit product until one final half-up rounding. Basis points
- * (percent x 100) would truncate a four-digit percent such as "0.0001";
- * this finer scale avoids that loss.
+ * SOL-149 R2: percents are unverified metadata. This scale is used only to
+ * validate the stored 0..100 grammar, never to derive an amount.
  */
 function scalePercentToBasisPoints(percentText: string): bigint {
   const [whole = '0', frac = ''] = percentText.split('.');

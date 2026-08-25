@@ -11,7 +11,7 @@
  */
 
 import { moneyNumber, moneyWire, RawDecimal } from '../money';
-import { dateLabel, moneyLabel, statusLabel } from '../projections';
+import { dateLabel, moneyLabel, receivableComponentLabel, statusLabel } from '../projections';
 import { minorFromDecimal, moneyText, wireNumber } from './projections';
 
 /** The quotation rows the send operation reads. */
@@ -339,6 +339,9 @@ export function invoiceWire(
         amount: wireNumber(component.amount),
         amountLabel: moneyLabel(component.amount, currency),
         kind: component.kind,
+        // SOL-149 R5 (option b): components render as planned draft structure.
+        // The label says which; live balances are invoice-level and cash-derived.
+        label: receivableComponentLabel(component.kind),
         outstandingAmount: rawOf(componentAmount - settled, currency),
         outstandingAmountLabel: moneyLabel(moneyText(componentAmount - settled), currency),
         settledAmount: wireNumber(component.settledAmount),
