@@ -27,7 +27,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { seedDatabase } from '@stdio/db';
-import { applyMigrations } from '@stdio/db/testing';
+import { applyMigrations, dropScratchDatabase } from '@stdio/db/testing';
 import type { Hono } from 'hono';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -326,14 +326,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await pool.end();
-  const cleaner = new pg.Client({ connectionString: adminUrl });
-  await cleaner.connect();
-  await cleaner.query(
-    `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
-    [testDb],
-  );
-  await cleaner.query(`DROP DATABASE IF EXISTS ${testDb}`);
-  await cleaner.end();
+  await dropScratchDatabase(adminUrl, testDb);
 }, 30_000);
 
 describe('SOL-25 tax discovery', () => {

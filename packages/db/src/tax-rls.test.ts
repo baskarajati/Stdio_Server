@@ -17,7 +17,7 @@ import { randomUUID } from 'node:crypto';
 import { PPN_STANDARD_2025 } from '@stdio/core';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { applyMigrations } from './testing/migrations';
+import { applyMigrations, dropScratchDatabase } from './testing/migrations';
 
 const adminUrl = process.env.DATABASE_URL ?? 'postgres://stdio:stdio@localhost:5432/stdio_dev';
 const testDb = `stdio_tax_rls_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
@@ -104,14 +104,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await admin.end();
-  const cleaner = new pg.Client({ connectionString: adminUrl });
-  await cleaner.connect();
-  await cleaner.query(
-    `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
-    [testDb],
-  );
-  await cleaner.query(`DROP DATABASE IF EXISTS ${testDb}`);
-  await cleaner.end();
+  await dropScratchDatabase(adminUrl, testDb);
 }, 30_000);
 
 describe('SOL-25 tax table isolation', () => {

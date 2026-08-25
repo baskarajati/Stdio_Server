@@ -12,7 +12,7 @@
 
 import { randomUUID } from 'node:crypto';
 
-import { applyMigrations } from '@stdio/db/testing';
+import { applyMigrations, dropScratchDatabase } from '@stdio/db/testing';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -127,9 +127,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await pool.end();
-  const admin = new pg.Pool({ connectionString: adminUrl, max: 1 });
-  await admin.query(`DROP DATABASE IF EXISTS ${testDb} WITH (FORCE)`);
-  await admin.end();
+  await dropScratchDatabase(adminUrl, testDb);
 });
 
 describe('quotation register with 4dp percentages', () => {
