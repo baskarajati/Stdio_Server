@@ -32,6 +32,11 @@ const BUILD_ENGAGEMENT = '00000000-0000-4000-8000-00000000000f';
 const OTHER_STUDIO = '00000000-0000-4000-8000-0000000000aa';
 const OTHER_USER = '00000000-0000-4000-8000-0000000000bb';
 const OTHER_PROJECT = '00000000-0000-4000-8000-0000000000cc';
+// SOL-167: a second studio project whose engagement does not belong to the
+// seeded project (cross-project negative), plus a foreign-studio engagement.
+const SEED_PROJECT_TWO = '00000000-0000-4000-8000-0000000000ee';
+const SEED_ENGAGEMENT_TWO = '00000000-0000-4000-8000-0000000000ef';
+const OTHER_ENGAGEMENT = '00000000-0000-4000-8000-0000000000a1';
 
 let pool: Pool;
 let app: ReturnType<typeof createApp>;
@@ -134,6 +139,20 @@ beforeAll(async () => {
        ON CONFLICT (id) DO NOTHING`,
       [SEED_STUDIO],
     );
+    // SOL-167: a second project + engagement that does not belong to the
+    // seeded project — the cross-project engagement negative.
+    await client.query(
+      `INSERT INTO projects (id, studio_id, project_code, name, client_id, status)
+       VALUES ($1, $2, 'REG-PRJ-2', 'Proyek Dua', $3, 'ACTIVE')
+       ON CONFLICT (id) DO NOTHING`,
+      [SEED_PROJECT_TWO, SEED_STUDIO, SEED_CLIENT],
+    );
+    await client.query(
+      `INSERT INTO project_engagements (id, studio_id, project_id, kind, sort_order)
+       VALUES ($1, $2, $3, 'BUILD', 1)
+       ON CONFLICT (id) DO NOTHING`,
+      [SEED_ENGAGEMENT_TWO, SEED_STUDIO, SEED_PROJECT_TWO],
+    );
   });
 
   await tenantQuery(OTHER_STUDIO, async (client) => {
@@ -165,6 +184,12 @@ beforeAll(async () => {
        VALUES ($1, $2, 'LAIN-001', 'Proyek Lain', $3, 'ACTIVE') ON CONFLICT DO NOTHING`,
       [OTHER_PROJECT, OTHER_STUDIO, otherClientId],
     );
+    // SOL-167: a foreign-studio engagement for the studio-boundary negative.
+    await client.query(
+      `INSERT INTO project_engagements (id, studio_id, project_id, kind, sort_order)
+       VALUES ($1, $2, $3, 'BUILD', 1) ON CONFLICT DO NOTHING`,
+      [OTHER_ENGAGEMENT, OTHER_STUDIO, OTHER_PROJECT],
+    );
   });
 
   // Clean the register rows this suite creates (unique marker prefix).
@@ -181,6 +206,10 @@ afterAll(async () => {
     await client.query(`DELETE FROM quotations WHERE quotation_number LIKE 'REG-%'`);
     await client.query(
       `DELETE FROM invoice_receivable_components WHERE invoice_id IN
+         (SELECT id FROM invoices WHERE invoice_number LIKE 'REG-%')`,
+    );
+    await client.query(
+      `DELETE FROM invoice_payments WHERE invoice_id IN
          (SELECT id FROM invoices WHERE invoice_number LIKE 'REG-%')`,
     );
     await client.query(`DELETE FROM invoices WHERE invoice_number LIKE 'REG-%'`);
@@ -485,6 +514,227 @@ describe('invoice register writes (project link)', () => {
       }),
     });
     expect(res.status).toBe(404);
+  });
+});
+
+describe('invoice engagement attachment (SOL-167)', () => {
+  /** The wire shape fields these tests consume (register + payment paths). */
+  type InvoiceWire = { id: string; entityVersion: string };
+  type RegisterWire = { data: { invoices: { id: string }[] } };
+  type PaymentWire = {
+    data: {
+      invoice: { id: string; paidAmount: number; payments: { methodLabel: string }[] };
+    };
+  };
+
+  /** Narrowed read of the Problem `code` field from an error response body. */
+  function problemCode(body: unknown): string | null {
+    if (body && typeof body === 'object' && 'code' in body) {
+      const code = body.code;
+      return typeof code === 'string' ? code : null;
+    }
+    return null;
+  }
+
+  /** Casts the create-write response boundary; the tests assert the shape. */
+  function invoiceWriteBody(body: unknown): { data: { invoice: InvoiceWire } } {
+    return body as { data: { invoice: InvoiceWire } };
+  }
+
+  /** Creates a bare unattached DRAFT invoice through the API. */
+  async function createPlainDraft(): Promise<InvoiceWire> {
+    const res = await app.request('/invoices', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem() },
+      body: JSON.stringify({
+        clientId: SEED_CLIENT,
+        projectId: SEED_PROJECT,
+        invoiceNumber: `REG-${randomUUID().slice(0, 8)}`,
+      }),
+    });
+    expect(res.status).toBe(201);
+    return invoiceWriteBody(await res.json()).data.invoice;
+  }
+
+  async function storedEngagement(invoiceId: string): Promise<string | null> {
+    let value: string | null = null;
+    await tenantQuery(SEED_STUDIO, async (client) => {
+      const rows = (await client.query(`SELECT engagement_id FROM invoices WHERE id = $1`, [
+        invoiceId,
+      ])) as { rows: { engagement_id: string | null }[] };
+      value = rows.rows[0]?.engagement_id ?? null;
+    });
+    return value;
+  }
+
+  async function registerInvoiceIds(): Promise<string[]> {
+    const res = await app.request(
+      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices`,
+      { headers: auth() },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as RegisterWire; // Response boundary cast.
+    return body.data.invoices.map((i) => i.id);
+  }
+
+  it('creates an engagement-attached DRAFT and shows it in the engagement register', async () => {
+    const res = await app.request('/invoices', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem() },
+      body: JSON.stringify({
+        clientId: SEED_CLIENT,
+        projectId: SEED_PROJECT,
+        engagementId: BUILD_ENGAGEMENT,
+        invoiceNumber: `REG-${randomUUID().slice(0, 8)}`,
+      }),
+    });
+    expect(res.status).toBe(201);
+    const body = invoiceWriteBody(await res.json());
+    expect(await storedEngagement(body.data.invoice.id)).toBe(BUILD_ENGAGEMENT);
+    expect(await registerInvoiceIds()).toContain(body.data.invoice.id);
+  });
+
+  it('404s a same-studio engagement that belongs to another project', async () => {
+    const res = await app.request('/invoices', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem() },
+      body: JSON.stringify({
+        clientId: SEED_CLIENT,
+        projectId: SEED_PROJECT,
+        engagementId: SEED_ENGAGEMENT_TWO,
+        invoiceNumber: `REG-${randomUUID().slice(0, 8)}`,
+      }),
+    });
+    expect(res.status).toBe(404);
+    expect(problemCode(await res.json())).toBe('ENGAGEMENT_NOT_FOUND');
+  });
+
+  it('404s a foreign-studio engagement and creates no invoice', async () => {
+    const res = await app.request('/invoices', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem() },
+      body: JSON.stringify({
+        clientId: SEED_CLIENT,
+        projectId: SEED_PROJECT,
+        engagementId: OTHER_ENGAGEMENT,
+        invoiceNumber: `REG-${randomUUID().slice(0, 8)}`,
+      }),
+    });
+    expect(res.status).toBe(404);
+    expect(problemCode(await res.json())).toBe('ENGAGEMENT_NOT_FOUND');
+  });
+
+  it('rejects a non-string engagementId with 422 INVALID_INVOICE', async () => {
+    const res = await app.request('/invoices', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem() },
+      body: JSON.stringify({
+        clientId: SEED_CLIENT,
+        projectId: SEED_PROJECT,
+        engagementId: 42,
+        invoiceNumber: `REG-${randomUUID().slice(0, 8)}`,
+      }),
+    });
+    expect(res.status).toBe(422);
+    expect(problemCode(await res.json())).toBe('INVALID_INVOICE');
+  });
+
+  it('moves a DRAFT invoice onto an engagement with PATCH', async () => {
+    const invoice = await createPlainDraft();
+    const res = await app.request(`/invoices/${invoice.id}`, {
+      method: 'PATCH',
+      headers: {
+        ...auth(),
+        'Idempotency-Key': idem(),
+        'If-Match': `"${invoice.entityVersion}"`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ engagementId: BUILD_ENGAGEMENT }),
+    });
+    expect(res.status).toBe(200);
+    expect(await storedEngagement(invoice.id)).toBe(BUILD_ENGAGEMENT);
+    expect(await registerInvoiceIds()).toContain(invoice.id);
+  });
+
+  it('404s a PATCH that moves the DRAFT to another project engagement', async () => {
+    const invoice = await createPlainDraft();
+    const res = await app.request(`/invoices/${invoice.id}`, {
+      method: 'PATCH',
+      headers: {
+        ...auth(),
+        'Idempotency-Key': idem(),
+        'If-Match': `"${invoice.entityVersion}"`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ engagementId: SEED_ENGAGEMENT_TWO }),
+    });
+    expect(res.status).toBe(404);
+    expect(problemCode(await res.json())).toBe('ENGAGEMENT_NOT_FOUND');
+    // The failed PATCH must not change the stored draft.
+    expect(await storedEngagement(invoice.id)).toBeNull();
+  });
+
+  it('detaches a DRAFT with engagementId null', async () => {
+    const created = await app.request('/invoices', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem() },
+      body: JSON.stringify({
+        clientId: SEED_CLIENT,
+        projectId: SEED_PROJECT,
+        engagementId: BUILD_ENGAGEMENT,
+        invoiceNumber: `REG-${randomUUID().slice(0, 8)}`,
+      }),
+    });
+    expect(created.status).toBe(201);
+    const createdBody = invoiceWriteBody(await created.json());
+    const res = await app.request(`/invoices/${createdBody.data.invoice.id}`, {
+      method: 'PATCH',
+      headers: {
+        ...auth(),
+        'Idempotency-Key': idem(),
+        'If-Match': `"${createdBody.data.invoice.entityVersion}"`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ engagementId: null }),
+    });
+    expect(res.status).toBe(200);
+    expect(await storedEngagement(createdBody.data.invoice.id)).toBeNull();
+  });
+
+  it('pays a register-created engagement-attached invoice via the SOL-132 route', async () => {
+    const res = await app.request('/invoices', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem(), 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientId: SEED_CLIENT,
+        projectId: SEED_PROJECT,
+        engagementId: BUILD_ENGAGEMENT,
+        invoiceNumber: `REG-${randomUUID().slice(0, 8)}`,
+        totalAmount: '1000000.00',
+      }),
+    });
+    expect(res.status).toBe(201);
+    const createdBody = invoiceWriteBody(await res.json());
+
+    const payment = await app.request(
+      `/projects/${SEED_PROJECT}/engagements/${BUILD_ENGAGEMENT}/invoices/${createdBody.data.invoice.id}/payment`,
+      {
+        method: 'POST',
+        headers: { ...auth(), 'Idempotency-Key': idem(), 'content-type': 'application/json' },
+        body: JSON.stringify({
+          amount: '100000.00',
+          date: '2026-08-25T00:00:00.000Z',
+          paymentMethod: 'TRANSFER',
+          reference: 'SOL-167-E2E',
+        }),
+      },
+    );
+    expect(payment.status).toBe(201);
+    const paymentBody = (await payment.json()) as PaymentWire; // Response boundary cast.
+    expect(paymentBody.data.invoice.id).toBe(createdBody.data.invoice.id);
+    expect(paymentBody.data.invoice.paidAmount).toBe(100000.0);
+    expect(paymentBody.data.invoice.payments).toHaveLength(1);
+    expect(paymentBody.data.invoice.payments[0]?.methodLabel).toBe('TRANSFER');
   });
 });
 

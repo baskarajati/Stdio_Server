@@ -17810,6 +17810,8 @@ components:
           type: string
         currency:
           type: string
+        engagementId:
+          type: string
         invoiceNumber:
           type: string
         projectId:
@@ -17826,8 +17828,10 @@ components:
       - invoiceNumber
       - projectId
       description: Create an invoice. `projectId` is required (non-null) and must name
-        a valid, existing project. `totalAmount` and `receivableComponents` are accepted
-        only while the invoice is a DRAFT (SOL-129).
+        a valid, existing project. `engagementId` is optional and must belong to `projectId`;
+        when supplied the DRAFT is attached to that engagement and is visible in the
+        engagement invoice register (SOL-167, D-019). `totalAmount` and `receivableComponents`
+        are accepted only while the invoice is a DRAFT (SOL-129).
 
     ReceivableComponentInput:
       additionalProperties: false
@@ -17857,6 +17861,10 @@ components:
           type:
           - string
           - 'null'
+        engagementId:
+          type:
+          - string
+          - 'null'
         totalAmount:
           $ref: '#/components/schemas/MoneyInput'
         receivableComponents:
@@ -17867,8 +17875,10 @@ components:
       description: 'Update an invoice, or replace its receivable components. An issued
         invoice is immutable - PATCH then returns 409 ENTITY_VERSION_CONFLICT with `details.draftPreserved:
         true`. Only a DRAFT is editable. `totalAmount` and `receivableComponents` are
-        accepted only on a DRAFT; `receivableComponents` replaces the stored set. The
-        issue operation computes tax from the draft total.'
+        accepted only on a DRAFT; `receivableComponents` replaces the stored set. `engagementId`
+        attaches the DRAFT to an engagement that belongs to the invoice project, or detaches
+        it with null (SOL-167, D-019). The issue operation computes tax from the draft
+        total.'
 
     InvoiceWriteResponse:
       additionalProperties: false

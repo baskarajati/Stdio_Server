@@ -1428,6 +1428,21 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
         requestId: c.get('requestId'),
       });
     }
+    // SOL-167: an optional engagementId attaches the DRAFT to the engagement
+    // (D-019). It must be a string; it is validated against projectId inside
+    // the transaction where the studio scope is live.
+    const rawEngagementId = req.engagementId;
+    const engagementProvided = rawEngagementId !== undefined;
+    const engagementId = typeof rawEngagementId === 'string' ? rawEngagementId : undefined;
+    if (engagementProvided && engagementId === undefined) {
+      return problem(c, {
+        status: 422,
+        code: 'INVALID_INVOICE',
+        title: 'Invalid invoice',
+        detail: 'engagementId must be a string.',
+        requestId: c.get('requestId'),
+      });
+    }
     // SOL-129: a draft may carry its total and receivable components.
     const hasTotal = req.totalAmount !== undefined;
     const hasComponents = req.receivableComponents !== undefined;
@@ -1498,6 +1513,19 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
       if (!projectRow) {
         return { status: 404, body: { code: 'PROJECT_NOT_FOUND' } };
       }
+      // SOL-167: the engagement must belong to this project inside this
+      // studio (D-019). A foreign-studio or cross-project id is a 404 and
+      // creates no invoice.
+      if (engagementProvided) {
+        const engagement = await resolveEngagementForRegister(
+          scoped,
+          projectId,
+          engagementId as string,
+        );
+        if (!engagement) {
+          return { status: 404, body: { code: 'ENGAGEMENT_NOT_FOUND' } };
+        }
+      }
       const client = await scoped.db
         .select({ id: clients.id })
         .from(clients)
@@ -1524,6 +1552,8 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
           invoiceNumber,
           clientId,
           projectId,
+          // SOL-167: attach the DRAFT to the engagement when supplied (D-019).
+          ...(engagementProvided ? { engagementId: engagementId as string } : {}),
           status: 'DRAFT',
           currency: (req.currency as string | undefined) ?? 'IDR',
           ...(hasTotal ? { totalAmount: moneyOutput(totalMinor) } : {}),
@@ -1601,6 +1631,21 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
       return parsed.response;
     }
     const req = parsed.body;
+    // SOL-167: PATCH may attach the DRAFT to an engagement or detach it with
+    // null (D-019). The engagement must belong to the invoice project; the
+    // check runs inside the transaction where the row is locked.
+    const hasEngagementField = 'engagementId' in req;
+    const rawEngagementId = req.engagementId;
+    const engagementId = typeof rawEngagementId === 'string' ? rawEngagementId : null;
+    if (hasEngagementField && rawEngagementId !== null && engagementId === null) {
+      return problem(c, {
+        status: 422,
+        code: 'INVALID_INVOICE',
+        title: 'Invalid invoice',
+        detail: 'engagementId must be a string or null.',
+        requestId: c.get('requestId'),
+      });
+    }
     // SOL-129: validate total/components up front; the DRAFT-only guard runs
     // inside the transaction where the current status is locked.
     const patchTotal = req.totalAmount !== undefined;
@@ -1664,7 +1709,12 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
     }
     return guardedRegisterWrite(c, pool, 'PATCH', async (scoped) => {
       const current = await scoped.db
-        .select({ id: invoices.id, entityVersion: invoices.entityVersion, status: invoices.status })
+        .select({
+          id: invoices.id,
+          entityVersion: invoices.entityVersion,
+          status: invoices.status,
+          projectId: invoices.projectId,
+        })
         .from(invoices)
         .where(eq(invoices.id, id))
         .for('update')
@@ -1693,6 +1743,17 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
             row.entityVersion,
           ),
         };
+      }
+      // SOL-167: an engagement move must stay on the invoice project (D-019).
+      // A cross-project or foreign-studio id is a 404 and changes nothing.
+      if (hasEngagementField && engagementId !== null) {
+        if (!row.projectId) {
+          return { status: 404, body: { code: 'ENGAGEMENT_NOT_FOUND' } };
+        }
+        const engagement = await resolveEngagementForRegister(scoped, row.projectId, engagementId);
+        if (!engagement) {
+          return { status: 404, body: { code: 'ENGAGEMENT_NOT_FOUND' } };
+        }
       }
       // SOL-156 condition 1: a total-only PATCH must not desync the stored
       // components. The stored parts must still sum to the new total; the
@@ -1728,6 +1789,8 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
       const values: Record<string, unknown> = { entityVersion: crypto.randomUUID() };
       if (req.currency !== undefined) values.currency = req.currency;
       if ('dueDate' in req) values.dueDate = req.dueDate ? new Date(req.dueDate as string) : null;
+      // SOL-167: attach the DRAFT to an engagement, or detach with null (D-019).
+      if (hasEngagementField) values.engagementId = engagementId;
       // SOL-129: a draft may carry its total; components replace wholesale.
       if (patchTotal) {
         values.totalAmount = moneyOutput(patchTotalMinor);

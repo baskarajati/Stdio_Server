@@ -157,3 +157,16 @@ describe('SOL-25 revision-24 contract conditions', () => {
     );
   });
 });
+
+describe('SOL-167 register-created invoice engagement attachment', () => {
+  it('declares engagementId on InvoiceCreateRequest (optional string)', () => {
+    const create = loadContract().components.schemas.InvoiceCreateRequest;
+    expect(create.properties.engagementId.type).toBe('string');
+    expect(create.required).not.toContain('engagementId');
+  });
+
+  it('declares engagementId on InvoiceUpdateRequest (string or null)', () => {
+    const update = loadContract().components.schemas.InvoiceUpdateRequest;
+    expect(update.properties.engagementId.type).toEqual(['string', 'null']);
+  });
+});
