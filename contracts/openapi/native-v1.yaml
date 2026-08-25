@@ -17754,13 +17754,38 @@ components:
           type: string
         projectId:
           type: string
+        totalAmount:
+          $ref: '#/components/schemas/MoneyInput'
+        receivableComponents:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReceivableComponentInput'
       type: object
       required:
       - clientId
       - invoiceNumber
       - projectId
       description: Create an invoice. `projectId` is required (non-null) and must name
-        a valid, existing project.
+        a valid, existing project. `totalAmount` and `receivableComponents` are accepted
+        only while the invoice is a DRAFT (SOL-129).
+
+    ReceivableComponentInput:
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          enum:
+          - DEPOSIT
+          - RETENTION
+          - BALANCE
+        amount:
+          $ref: '#/components/schemas/MoneyInput'
+      type: object
+      required:
+      - amount
+      - kind
+      description: One planned receivable part on a DRAFT invoice. The amounts must
+        sum to the draft `totalAmount` when both are supplied (SOL-129).
 
     InvoiceUpdateRequest:
       additionalProperties: false
@@ -17772,10 +17797,18 @@ components:
           type:
           - string
           - 'null'
+        totalAmount:
+          $ref: '#/components/schemas/MoneyInput'
+        receivableComponents:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReceivableComponentInput'
       type: object
       description: 'Update an invoice, or replace its receivable components. An issued
         invoice is immutable - PATCH then returns 409 ENTITY_VERSION_CONFLICT with `details.draftPreserved:
-        true`. Only a DRAFT is editable.'
+        true`. Only a DRAFT is editable. `totalAmount` and `receivableComponents` are
+        accepted only on a DRAFT; `receivableComponents` replaces the stored set. The
+        issue operation computes tax from the draft total.'
 
     InvoiceWriteResponse:
       additionalProperties: false

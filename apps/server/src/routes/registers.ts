@@ -21,6 +21,7 @@
  * `InvoiceDetail`), so the register reads can reuse the same projections.
  */
 
+import { MoneyInputError, moneyOutput, parseStrictMoneyInput } from '@stdio/core';
 import { schema } from '@stdio/db';
 import { and, count, eq } from 'drizzle-orm';
 import type { Hono } from 'hono';
@@ -42,6 +43,7 @@ const {
   quotationItems,
   invoices,
   invoicePayments,
+  invoiceReceivableComponents,
   users,
   projects,
   projectEngagements,
@@ -472,10 +474,64 @@ type InvoiceRegisterRow = {
   projectName?: string | null;
 };
 
+/**
+ * SOL-129: parses one contract `MoneyInput` for the invoice draft-total
+ * writes. Throws `MoneyInputError`; callers map it to the 422 Problem.
+ */
+function parseDraftTotal(raw: unknown): bigint {
+  return parseStrictMoneyInput(raw as string | number);
+}
+
+/** One validated receivable-component input (SOL-129). */
+type ParsedComponent = { kind: string; amountMinor: bigint };
+
+/**
+ * Validates and parses the `receivableComponents` request array. Returns
+ * null when the shape is not a valid component list. An empty array is a
+ * valid "clear the components" instruction.
+ */
+function parseDraftComponents(
+  raw: unknown,
+): { ok: true; components: ParsedComponent[] } | { ok: false } {
+  if (!Array.isArray(raw)) {
+    return { ok: false };
+  }
+  const components: ParsedComponent[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      return { ok: false };
+    }
+    const record = entry as Record<string, unknown>;
+    const kind = record.kind;
+    const amount = record.amount;
+    if (
+      typeof kind !== 'string' ||
+      !['DEPOSIT', 'RETENTION', 'BALANCE'].includes(kind) ||
+      (typeof amount !== 'string' && typeof amount !== 'number')
+    ) {
+      return { ok: false };
+    }
+    try {
+      components.push({ kind, amountMinor: parseDraftTotal(amount) });
+    } catch {
+      throw new MoneyInputError(
+        'MONEY_FORMAT_INVALID',
+        `Receivable component amount is not valid money input.`,
+      );
+    }
+  }
+  return { ok: true, components };
+}
+
 async function loadInvoiceRegister(
   scoped: Db,
   id: string,
-): Promise<{ row: InvoiceRegisterRow; paymentCount: number; paidAmount: string | null } | null> {
+): Promise<{
+  row: InvoiceRegisterRow;
+  paymentCount: number;
+  components: { kind: string; amount: string; settledAmount: string }[];
+  paidAmount: string | null;
+} | null> {
   const rows = await scoped.db
     .select({
       id: invoices.id,
@@ -503,13 +559,25 @@ async function loadInvoiceRegister(
   if (!row) {
     return null;
   }
-  const paymentRows = await scoped.db
-    .select({ value: count() })
-    .from(invoicePayments)
-    .where(eq(invoicePayments.invoiceId, id));
+  const [paymentRows, componentRows] = await Promise.all([
+    scoped.db
+      .select({ value: count() })
+      .from(invoicePayments)
+      .where(eq(invoicePayments.invoiceId, id)),
+    scoped.db
+      .select({
+        kind: invoiceReceivableComponents.kind,
+        amount: invoiceReceivableComponents.amount,
+        settledAmount: invoiceReceivableComponents.settledAmount,
+      })
+      .from(invoiceReceivableComponents)
+      .where(eq(invoiceReceivableComponents.invoiceId, id))
+      .orderBy(invoiceReceivableComponents.kind),
+  ]);
   return {
     row,
     paymentCount: Number(paymentRows[0]?.value ?? 0),
+    components: componentRows,
     paidAmount: null,
   };
 }
@@ -519,6 +587,7 @@ function projectInvoiceRegister(
   paymentCount: number,
   canReadFinance: boolean,
   role: Parameters<typeof projectCapabilities>[0],
+  components: { kind: string; amount: string; settledAmount: string }[] = [],
 ): Record<string, unknown> {
   const currency = row.currency ?? 'IDR';
   const status = row.status;
@@ -543,7 +612,14 @@ function projectInvoiceRegister(
     issuedAt: row.issuedAt ? row.issuedAt.toISOString() : null,
     outstandingAmountLabel: canReadFinance ? moneyLabel(row.totalAmount, currency) : '',
     paidAmountLabel: canReadFinance ? moneyLabel(null, currency) : '',
-    receivableComponents: [],
+    receivableComponents: components.map((component) => ({
+      kind: component.kind,
+      amountLabel: canReadFinance ? moneyLabel(component.amount, currency) : '',
+      settledAmountLabel: canReadFinance ? moneyLabel(component.settledAmount, currency) : '',
+      outstandingAmountLabel: canReadFinance
+        ? moneyLabel(subtractDecimal(component.amount, component.settledAmount), currency)
+        : '',
+    })),
     projectName: row.projectName,
     source: { href: `/invoices/${row.id}`, type: 'invoice' },
     status,
@@ -1352,6 +1428,66 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
         requestId: c.get('requestId'),
       });
     }
+    // SOL-129: a draft may carry its total and receivable components.
+    const hasTotal = req.totalAmount !== undefined;
+    const hasComponents = req.receivableComponents !== undefined;
+    let totalMinor = 0n;
+    let components: ParsedComponent[] = [];
+    try {
+      if (hasTotal) {
+        totalMinor = parseDraftTotal(req.totalAmount);
+        if (totalMinor <= 0n) {
+          throw new MoneyInputError('MONEY_OUT_OF_RANGE', 'The invoice total must be positive.');
+        }
+      }
+      if (hasComponents) {
+        const parsedComponents = parseDraftComponents(req.receivableComponents);
+        if (!parsedComponents.ok) {
+          return problem(c, {
+            status: 422,
+            code: 'INVALID_INVOICE',
+            title: 'Invalid invoice',
+            detail:
+              'receivableComponents must be a list of { kind, amount } parts with kinds DEPOSIT, RETENTION or BALANCE.',
+            requestId: c.get('requestId'),
+          });
+        }
+        components = parsedComponents.components;
+      }
+      if (hasComponents && !hasTotal) {
+        return problem(c, {
+          status: 422,
+          code: 'INVALID_INVOICE',
+          title: 'Invalid invoice',
+          detail: 'receivableComponents require totalAmount on the same request.',
+          requestId: c.get('requestId'),
+        });
+      }
+      if (hasTotal && components.length > 0) {
+        const sumMinor = components.reduce((sum, part) => sum + part.amountMinor, 0n);
+        if (sumMinor !== totalMinor) {
+          return problem(c, {
+            status: 422,
+            code: 'COMPONENT_SUM_MISMATCH',
+            title: 'Component sum mismatch',
+            detail: 'The receivable component amounts must sum to the invoice total.',
+            requestId: c.get('requestId'),
+            details: { sumMinor: String(sumMinor), totalMinor: String(totalMinor) },
+          });
+        }
+      }
+    } catch (error) {
+      if (error instanceof MoneyInputError) {
+        return problem(c, {
+          status: 422,
+          code: error.code,
+          title: 'Money input invalid',
+          detail: error.message,
+          requestId: c.get('requestId'),
+        });
+      }
+      throw error;
+    }
     return guardedRegisterWrite(c, pool, 'POST', async (scoped) => {
       const project = await scoped.db
         .select({ id: projects.id, clientId: projects.clientId })
@@ -1380,6 +1516,7 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
           },
         };
       }
+      // SOL-129: a draft may carry its total; components replace wholesale.
       const inserted = await scoped.db
         .insert(invoices)
         .values({
@@ -1389,12 +1526,28 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
           projectId,
           status: 'DRAFT',
           currency: (req.currency as string | undefined) ?? 'IDR',
+          ...(hasTotal ? { totalAmount: moneyOutput(totalMinor) } : {}),
           entityVersion: crypto.randomUUID(),
         })
         .returning({ id: invoices.id });
       const created = inserted[0];
       if (!created) {
         return { status: 500, body: { code: 'WRITE_FAILED' } };
+      }
+      if (hasComponents) {
+        await scoped.db
+          .delete(invoiceReceivableComponents)
+          .where(eq(invoiceReceivableComponents.invoiceId, created.id));
+        if (components.length > 0) {
+          await scoped.db.insert(invoiceReceivableComponents).values(
+            components.map((part) => ({
+              studioId: scoped.studioId,
+              invoiceId: created.id,
+              kind: part.kind,
+              amount: moneyOutput(part.amountMinor),
+            })),
+          );
+        }
       }
       const loaded = await loadInvoiceRegister(scoped, created.id);
       if (!loaded) {
@@ -1410,6 +1563,7 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
               loaded.paymentCount,
               projectCapabilities(user.role).canReadFinance.enabled,
               user.role,
+              loaded.components,
             ),
           },
           meta: mutationMeta(c.get('requestId')),
@@ -1447,6 +1601,67 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
       return parsed.response;
     }
     const req = parsed.body;
+    // SOL-129: validate total/components up front; the DRAFT-only guard runs
+    // inside the transaction where the current status is locked.
+    const patchTotal = req.totalAmount !== undefined;
+    const patchComponents = req.receivableComponents !== undefined;
+    let patchTotalMinor = 0n;
+    let patchParts: ParsedComponent[] = [];
+    try {
+      if (patchTotal) {
+        patchTotalMinor = parseDraftTotal(req.totalAmount);
+        if (patchTotalMinor <= 0n) {
+          throw new MoneyInputError('MONEY_OUT_OF_RANGE', 'The invoice total must be positive.');
+        }
+      }
+      if (patchComponents) {
+        const parsedComponents = parseDraftComponents(req.receivableComponents);
+        if (!parsedComponents.ok) {
+          return problem(c, {
+            status: 422,
+            code: 'INVALID_INVOICE',
+            title: 'Invalid invoice',
+            detail:
+              'receivableComponents must be a list of { kind, amount } parts with kinds DEPOSIT, RETENTION or BALANCE.',
+            requestId: c.get('requestId'),
+          });
+        }
+        patchParts = parsedComponents.components;
+      }
+      if (patchComponents && !patchTotal) {
+        return problem(c, {
+          status: 422,
+          code: 'INVALID_INVOICE',
+          title: 'Invalid invoice',
+          detail: 'receivableComponents require totalAmount on the same request.',
+          requestId: c.get('requestId'),
+        });
+      }
+      if (patchTotal && patchParts.length > 0) {
+        const sumMinor = patchParts.reduce((sum, part) => sum + part.amountMinor, 0n);
+        if (sumMinor !== patchTotalMinor) {
+          return problem(c, {
+            status: 422,
+            code: 'COMPONENT_SUM_MISMATCH',
+            title: 'Component sum mismatch',
+            detail: 'The receivable component amounts must sum to the invoice total.',
+            requestId: c.get('requestId'),
+            details: { sumMinor: String(sumMinor), totalMinor: String(patchTotalMinor) },
+          });
+        }
+      }
+    } catch (error) {
+      if (error instanceof MoneyInputError) {
+        return problem(c, {
+          status: 422,
+          code: error.code,
+          title: 'Money input invalid',
+          detail: error.message,
+          requestId: c.get('requestId'),
+        });
+      }
+      throw error;
+    }
     return guardedRegisterWrite(c, pool, 'PATCH', async (scoped) => {
       const current = await scoped.db
         .select({ id: invoices.id, entityVersion: invoices.entityVersion, status: invoices.status })
@@ -1482,7 +1697,26 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
       const values: Record<string, unknown> = { entityVersion: crypto.randomUUID() };
       if (req.currency !== undefined) values.currency = req.currency;
       if ('dueDate' in req) values.dueDate = req.dueDate ? new Date(req.dueDate as string) : null;
+      // SOL-129: a draft may carry its total; components replace wholesale.
+      if (patchTotal) {
+        values.totalAmount = moneyOutput(patchTotalMinor);
+      }
       await scoped.db.update(invoices).set(values).where(eq(invoices.id, id));
+      if (patchComponents) {
+        await scoped.db
+          .delete(invoiceReceivableComponents)
+          .where(eq(invoiceReceivableComponents.invoiceId, id));
+        if (patchParts.length > 0) {
+          await scoped.db.insert(invoiceReceivableComponents).values(
+            patchParts.map((part) => ({
+              studioId: scoped.studioId,
+              invoiceId: id,
+              kind: part.kind,
+              amount: moneyOutput(part.amountMinor),
+            })),
+          );
+        }
+      }
       const loaded = await loadInvoiceRegister(scoped, id);
       if (!loaded) {
         return { status: 500, body: { code: 'WRITE_FAILED' } };
@@ -1497,6 +1731,7 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
               loaded.paymentCount,
               projectCapabilities(user.role).canReadFinance.enabled,
               user.role,
+              loaded.components,
             ),
           },
           meta: mutationMeta(c.get('requestId')),
@@ -1504,6 +1739,18 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
       };
     });
   });
+}
+
+/** Subtracts two canonical `numeric(20,2)` strings exactly (BigInt minor units). */
+function subtractDecimal(minuend: string, subtrahend: string): string {
+  const toMinor = (value: string): bigint => {
+    const negative = value.startsWith('-');
+    const unsigned = negative ? value.slice(1) : value;
+    const [whole = '0', frac = '00'] = unsigned.split('.');
+    const absMinor = BigInt(whole || '0') * 100n + BigInt(`${frac}00`.slice(0, 2));
+    return negative ? -absMinor : absMinor;
+  };
+  return moneyOutput(toMinor(minuend) - toMinor(subtrahend));
 }
 
 /** Verifies an engagement belongs to the route's project inside this studio. */
