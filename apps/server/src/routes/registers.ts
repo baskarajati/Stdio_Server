@@ -1694,6 +1694,37 @@ export function registerRegisterRoutes(app: Hono<ServerEnv>, pool: Pool): void {
           ),
         };
       }
+      // SOL-156 condition 1: a total-only PATCH must not desync the stored
+      // components. The stored parts must still sum to the new total; the
+      // caller can send components on the same request to replace them.
+      if (patchTotal && !patchComponents) {
+        const storedComponents = await scoped.db
+          .select({ amount: invoiceReceivableComponents.amount })
+          .from(invoiceReceivableComponents)
+          .where(eq(invoiceReceivableComponents.invoiceId, id));
+        // A draft may carry a total without parts (POST totalAmount only).
+        if (storedComponents.length > 0) {
+          const storedSum = storedComponents.reduce(
+            (sum, part) => sum + parseStrictMoneyInput(part.amount),
+            0n,
+          );
+          if (storedSum !== patchTotalMinor) {
+            return {
+              status: 422,
+              body: {
+                type: 'urn:stdio:error',
+                title: 'Component sum mismatch',
+                status: 422,
+                code: 'COMPONENT_SUM_MISMATCH',
+                detail:
+                  'The stored receivable component amounts must sum to the new invoice total.',
+                requestId: c.get('requestId'),
+                details: { sumMinor: String(storedSum), totalMinor: String(patchTotalMinor) },
+              },
+            };
+          }
+        }
+      }
       const values: Record<string, unknown> = { entityVersion: crypto.randomUUID() };
       if (req.currency !== undefined) values.currency = req.currency;
       if ('dueDate' in req) values.dueDate = req.dueDate ? new Date(req.dueDate as string) : null;

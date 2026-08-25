@@ -690,4 +690,90 @@ describe('invoice draft totals (SOL-129)', () => {
     expect(res.status).toBe(409);
     expect(((await res.json()) as any).details.draftPreserved).toBe(true);
   });
+
+  it('rejects a total-only PATCH that desyncs stored components (SOL-156 condition 1)', async () => {
+    const created = await app.request('/invoices', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem(), 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientId: SEED_CLIENT,
+        projectId: SEED_PROJECT,
+        invoiceNumber: `REG-${randomUUID().slice(0, 8)}`,
+        totalAmount: '100.00',
+        receivableComponents: [
+          { kind: 'DEPOSIT', amount: '60.00' },
+          { kind: 'BALANCE', amount: '40.00' },
+        ],
+      }),
+    });
+    expect(created.status).toBe(201);
+    const invoice = ((await created.json()) as any).data.invoice;
+
+    const res = await app.request(`/invoices/${invoice.id}`, {
+      method: 'PATCH',
+      headers: {
+        ...auth(),
+        'Idempotency-Key': idem(),
+        'If-Match': `"${invoice.entityVersion}"`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ totalAmount: '150.00' }),
+    });
+    expect(res.status).toBe(422);
+    const problem = (await res.json()) as any;
+    expect(problem.code).toBe('COMPONENT_SUM_MISMATCH');
+    expect(problem.details).toEqual({
+      sumMinor: '10000',
+      totalMinor: '15000',
+    });
+    // The failed PATCH must not change the stored draft.
+    await tenantQuery(SEED_STUDIO, async (client) => {
+      const inv = (await client.query(`SELECT total_amount FROM invoices WHERE id = $1`, [
+        invoice.id,
+      ])) as { rows: { total_amount: string }[] };
+      expect(inv.rows[0]?.total_amount).toBe('100.00');
+      const comps = (await client.query(
+        `SELECT count(*)::int AS n FROM invoice_receivable_components WHERE invoice_id = $1`,
+        [invoice.id],
+      )) as { rows: { n: number }[] };
+      expect(comps.rows[0]?.n).toBe(2);
+    });
+  });
+
+  it('accepts a total-only PATCH when the stored component sum matches', async () => {
+    const created = await app.request('/invoices', {
+      method: 'POST',
+      headers: { ...auth(), 'Idempotency-Key': idem(), 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientId: SEED_CLIENT,
+        projectId: SEED_PROJECT,
+        invoiceNumber: `REG-${randomUUID().slice(0, 8)}`,
+        totalAmount: '100.00',
+        receivableComponents: [
+          { kind: 'DEPOSIT', amount: '60.00' },
+          { kind: 'BALANCE', amount: '40.00' },
+        ],
+      }),
+    });
+    expect(created.status).toBe(201);
+    const invoice = ((await created.json()) as any).data.invoice;
+
+    const res = await app.request(`/invoices/${invoice.id}`, {
+      method: 'PATCH',
+      headers: {
+        ...auth(),
+        'Idempotency-Key': idem(),
+        'If-Match': `"${invoice.entityVersion}"`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ totalAmount: '100.00' }),
+    });
+    expect(res.status).toBe(200);
+    await tenantQuery(SEED_STUDIO, async (client) => {
+      const inv = (await client.query(`SELECT total_amount FROM invoices WHERE id = $1`, [
+        invoice.id,
+      ])) as { rows: { total_amount: string }[] };
+      expect(inv.rows[0]?.total_amount).toBe('100.00');
+    });
+  });
 });
