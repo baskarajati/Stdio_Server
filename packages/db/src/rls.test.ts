@@ -17,7 +17,7 @@ import {
 } from '@stdio/core';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { applyMigrations } from './testing/migrations';
+import { applyMigrations, dropScratchDatabase } from './testing/migrations';
 
 const adminUrl = process.env.DATABASE_URL ?? 'postgres://stdio:stdio@localhost:5432/stdio_dev';
 const testDb = `stdio_rls_test_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
@@ -86,18 +86,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await admin.end().catch(() => undefined);
-  const cleaner = new pg.Client({ connectionString: adminUrl });
-  await cleaner.connect();
-  // `DROP DATABASE ... WITH (FORCE)` needs superuser rights to terminate
-  // backends, and `stdio` is not a superuser. Terminate the scratch
-  // database's remaining `stdio` backends first: a role may always signal
-  // its own sessions. Then the drop succeeds without FORCE.
-  await cleaner.query(
-    'SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()',
-    [testDb],
-  );
-  await cleaner.query(`DROP DATABASE IF EXISTS ${testDb}`);
-  await cleaner.end();
+  await dropScratchDatabase(adminUrl, testDb);
 }, 60_000);
 
 describe('the studio boundary', () => {
