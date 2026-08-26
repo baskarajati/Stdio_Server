@@ -1399,10 +1399,12 @@ paths:
     post:
       operationId: recordNativeEngagementInvoicePayment
       summary: >-
-        Record one engagement invoice payment (SOL-132). The plain payload
-        (amount + date + paymentMethod) records the cash that arrived; an
-        optional percent split (grossAmount plus pphPercent/retensiPercent)
-        also records the PPh and retensi withheld parts on the same row. The
+        Record one engagement invoice payment (SOL-132, amended by SOL-149 to
+        amount-first entry). The plain payload (amount + date + paymentMethod)
+        records the cash that arrived; an optional split (grossAmount plus the
+        entered pphAmount/retensiAmount, with optional percent metadata)
+        also records the withheld parts on the same row. Payments require an
+        issued invoice and cumulative cash at or below the invoice total. The
         capability is OWNER-only; other roles receive 403 CAPABILITY_DENIED.
       parameters:
         - $ref: "#/components/parameters/NativeBuild"
@@ -9870,20 +9872,28 @@ components:
     ProjectFinanceInvoicePaymentRequest:
       additionalProperties: false
       description: >-
-        A payment write against one engagement invoice. `amount` is the cash
-        that arrived. When any of `grossAmount`, `pphPercent` or
-        `retensiPercent` is present, the request is a split: `grossAmount` is
-        required, each percent applies to the gross, and the server derives the
-        withheld parts in exact integer minor units (percent scaled at 10^4
-        parts-per-million, rounded half-up per share). Invariant: `amount` must
-        equal `grossAmount` minus PPh minus retensi; a deviation returns 422
-        PAYMENT_SPLIT_MISMATCH, and shares that exceed the gross return 422
-        PAYMENT_SPLIT_OVER_GROSS. The percent grammar is a decimal with up to
-        four fractional digits in 0..100 (422 PAYMENT_PERCENT_INVALID /
-        PAYMENT_PERCENT_OUT_OF_RANGE otherwise). A plain request (no split
-        fields) records only `amount`; the `payments[]` projection always
-        emits id/amount/amountLabel/date/dateLabel/methodLabel and never the
-        split data, which stays server-side (SOL-132).
+        A payment write against one engagement invoice (SOL-132, amended by
+        ruling SOL-149 to amount-first entry). `amount` is the cash that
+        arrived. When any of `grossAmount`, `pphAmount`, `retensiAmount`,
+        `pphPercent` or `retensiPercent` is present, the request is a split:
+        `grossAmount` is required, and `pphAmount` / `retensiAmount` are the
+        entered withheld parts (the payee-stated PPh and the contractual
+        retention). The server never derives an amount from a percent
+        (SOL-20 defers PPh withholding calculation). Invariant: `amount` must
+        equal `grossAmount` minus PPh minus retensi, exactly in integer minor
+        units; a deviation returns 422 PAYMENT_SPLIT_MISMATCH, and entered
+        amounts that exceed the gross return 422 PAYMENT_SPLIT_OVER_GROSS.
+        `pphPercent` and `retensiPercent` are unverified metadata only: the
+        grammar is a decimal with up to four fractional digits in 0..100 (422
+        PAYMENT_PERCENT_INVALID / PAYMENT_PERCENT_OUT_OF_RANGE otherwise),
+        stored verbatim and never used in arithmetic. A plain request (no
+        split fields) records only `amount` and stores `grossAmount = amount`.
+        Payments require an issued invoice (status ISSUED or PAID); any other
+        status returns 422 PAYMENT_INVOICE_NOT_ISSUED. Cumulative cash after
+        this payment must not exceed the invoice total; an overpayment returns
+        422 PAYMENT_OVER_TOTAL. The `payments[]` projection always emits
+        id/amount/amountLabel/date/dateLabel/methodLabel and never the split
+        data, which stays server-side.
       properties:
         amount:
           minLength: 1
@@ -9902,15 +9912,33 @@ components:
           type: string
         grossAmount:
           $ref: '#/components/schemas/MoneyInput'
-          description: The invoiced amount the client settled. Required when a percent split is present.
+          description: The invoiced amount the client settled. Required when any split field is present.
+        pphAmount:
+          $ref: '#/components/schemas/MoneyInput'
+          description: >-
+            The entered PPh withheld amount (SOL-149 R2), stated by the payee
+            (bukti potong / berita acara) and unverified by Stdio. Never
+            derived from `pphPercent`. Defaults to zero when absent.
+        retensiAmount:
+          $ref: '#/components/schemas/MoneyInput'
+          description: >-
+            The entered retention held amount (SOL-149 R2b), contractual and
+            editable per engagement (A-010). Never derived from
+            `retensiPercent`. Defaults to zero when absent.
         pphPercent:
           type: string
           pattern: '^\d+(\.\d{1,4})?$'
-          description: PPh withholding as a percent of the gross, 0..100 inclusive, up to four fractional digits.
+          description: >-
+            Unverified metadata only: the supplier-stated PPh percent, 0..100
+            inclusive, up to four fractional digits. Never an arithmetic
+            input; never validated against `pphAmount`.
         retensiPercent:
           type: string
           pattern: '^\d+(\.\d{1,4})?$'
-          description: Retention as a percent of the gross, 0..100 inclusive, up to four fractional digits.
+          description: >-
+            Unverified metadata only: the contractual retention percent, 0..100
+            inclusive, up to four fractional digits. Never an arithmetic
+            input; never validated against `retensiAmount`.
         reference:
           type: string
           description: Free-form payment reference, such as a bank transfer number.
@@ -10015,6 +10043,11 @@ components:
         paidAmountLabel:
           type: string
         receivableComponents:
+          description: >-
+            The planned draft structure of the invoice (SOL-149 R5, option b).
+            These amounts are the components as entered at draft time; they are
+            never a live balance. `label` says which. Live balances are
+            invoice-level and cash-derived: `paidAmount` and `outstandingAmount`.
           type: array
           items:
             additionalProperties: false
@@ -10025,6 +10058,13 @@ components:
                 type: string
               kind:
                 type: string
+              label:
+                type:
+                  - string
+                  - "null"
+                description: >-
+                  The descriptive label, e.g. "Deposit (planned)" or
+                  "Retention held - receivable, not yet due" (D-033).
               outstandingAmount:
                 type: number
               outstandingAmountLabel:
@@ -10037,6 +10077,7 @@ components:
               - amount
               - amountLabel
               - kind
+              - label
               - outstandingAmount
               - outstandingAmountLabel
               - settledAmount
@@ -13023,11 +13064,22 @@ components:
       type: object
     InvoiceReceivableComponent:
       additionalProperties: false
+      description: >-
+        One planned receivable component of an invoice (SOL-149 R5, option b).
+        Components render as planned draft structure only; live balances are
+        invoice-level and cash-derived. `label` says which.
       properties:
         amountLabel:
           type: string
         kind:
           type: string
+        label:
+          type:
+            - string
+            - "null"
+          description: >-
+            The descriptive label, e.g. "Deposit (planned)" or
+            "Retention held - receivable, not yet due" (D-033).
         outstandingAmountLabel:
           type: string
         settledAmountLabel:
@@ -13035,6 +13087,7 @@ components:
       required:
         - amountLabel
         - kind
+        - label
         - outstandingAmountLabel
         - settledAmountLabel
       type: object

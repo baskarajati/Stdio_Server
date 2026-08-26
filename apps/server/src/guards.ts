@@ -213,6 +213,18 @@ const HANDLER_PROBLEM_SPECS: Record<string, { title: string; detail: string }> =
     title: 'Invalid client',
     detail: 'The client reference is invalid.',
   },
+  PAYMENT_INVOICE_NOT_ISSUED: {
+    title: 'Invoice not issued',
+    detail: 'Payments require an issued invoice; this invoice is not issued.',
+  },
+  PAYMENT_OVER_TOTAL: {
+    title: 'Payment exceeds the invoice total',
+    detail: 'This payment would exceed the invoice total.',
+  },
+  INVOICE_TOTAL_REQUIRED: {
+    title: 'Invoice total required',
+    detail: 'A payment requires an invoice total; this invoice has none.',
+  },
   WRITE_FAILED: {
     title: 'Write failed',
     detail: 'The write did not complete; the server could not apply the change.',
